@@ -1,0 +1,4 @@
+mcp
+psycopg[binary]
+openpyxl
+python-dotenv
