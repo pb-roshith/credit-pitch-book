@@ -1,7 +1,12 @@
+import ast
 import json
 import os
 import re
 import shutil
+import socket
+import subprocess
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from random import Random
@@ -18,7 +23,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 MCP_ROOT = ROOT_DIR / 'mcp'
-SOURCE_MCP_DIR = ROOT_DIR / 'intel_mcp'
+SOURCE_MCP_DIR = MCP_ROOT / 'intel_mcp'
 GENERATED_ROOT = ROOT_DIR / 'generated_manufactured_data'
 
 PDF_FILES = [
@@ -41,6 +46,30 @@ PDF_FILES = [
     'Purpose_of_Loan.pdf',
 ]
 
+EXCEL_TABLE_NAMES = (
+    'credit_dossier.credit_balance_sheet',
+    'credit_dossier.credit_cashflow_statement',
+    'credit_dossier.credit_income_statement',
+    'credit_dossier.credit_bank_statements',
+    'credit_dossier.credit_net_worth_statement',
+    'credit_dossier.credit_projected_financials',
+)
+SECTION2_TABLE_NAMES = (
+    'credit_dossier.section2_customer_information',
+    'credit_dossier.section2_ownership_structure',
+)
+SECTION3_TABLE_NAMES = (
+    'credit_dossier.section3_customer_financial_information_historical',
+    'credit_dossier.section3a_financial_forecast',
+    'credit_dossier.section3a_customer_facilities',
+    'credit_dossier.section3a_other_financial_institution_exposure',
+    'credit_dossier.section3a_collateral_guarantee_information',
+    'credit_dossier.section3b_documentation_security_exceptions',
+    'credit_dossier.section3b_covenant_description',
+    'credit_dossier.section3b_credit_committee_resolution',
+)
+ALL_CLIENT_TABLE_NAMES = EXCEL_TABLE_NAMES + SECTION2_TABLE_NAMES + SECTION3_TABLE_NAMES
+
 
 def slugify(value):
     slug = re.sub(r'[^a-z0-9]+', '_', value.lower()).strip('_')
@@ -49,6 +78,114 @@ def slugify(value):
 
 def db_name_for_client(client_name):
     return f'{slugify(client_name)}_mcp_db'
+
+
+def client_data_dir(client_slug):
+    return GENERATED_ROOT / client_slug
+
+
+def manifest_path(client_slug):
+    return client_data_dir(client_slug) / 'manifest.json'
+
+
+def load_manifest(client_slug):
+    path = manifest_path(client_slug)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_manifest(client_slug, context, library_id, documents):
+    directory = client_data_dir(client_slug)
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'context': compact_context(context),
+        'libraryId': library_id,
+        'documents': documents,
+        'updatedAt': datetime.now().isoformat(timespec='seconds'),
+    }
+    manifest_path(client_slug).write_text(json.dumps(payload, indent=2), encoding='utf-8')
+
+
+def existing_pdf_paths(client_slug):
+    docs_dir = client_data_dir(client_slug) / 'pdfs'
+    return {
+        filename: docs_dir / filename
+        for filename in PDF_FILES
+        if (docs_dir / filename).is_file() and (docs_dir / filename).stat().st_size > 0
+    }
+
+
+def load_mcp_document_config(client_slug):
+    config_path = MCP_ROOT / f'{client_slug}_mcp' / 'mistral_pdf_config.py'
+    if not config_path.exists():
+        return []
+    try:
+        module = ast.parse(config_path.read_text(encoding='utf-8'))
+        assignment = next(
+            node for node in module.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == 'MISTRAL_PDF_DOCUMENTS' for target in node.targets)
+        )
+        documents = ast.literal_eval(assignment.value)
+        return documents if isinstance(documents, list) else []
+    except (OSError, SyntaxError, ValueError, StopIteration):
+        return []
+
+
+def load_existing_mistral_assets(client_slug):
+    values = dotenv_values(MCP_ROOT / f'{client_slug}_mcp' / '.env')
+    library_id = values.get('MISTRAL_LIBRARY_ID') or None
+    documents = load_mcp_document_config(client_slug)
+    return library_id, documents
+
+
+def missing_document_names(documents):
+    available = {
+        document.get('name')
+        for document in documents
+        if isinstance(document, dict) and document.get('name') and document.get('document_id')
+    }
+    return [filename for filename in PDF_FILES if filename not in available]
+
+
+def existing_or_new_context(client_slug, client_name, industry, geography):
+    manifest_context = load_manifest(client_slug).get('context')
+    if isinstance(manifest_context, dict) and manifest_context:
+        return manifest_context
+
+    has_existing_output = (
+        client_data_dir(client_slug).exists()
+        or (MCP_ROOT / f'{client_slug}_mcp').exists()
+    )
+    return build_context(client_name, industry, geography) if has_existing_output else generate_context_with_agent(client_name, industry, geography)
+
+
+def mcp_needs_refresh(client_slug, dbname, library_id, documents):
+    target = MCP_ROOT / f'{client_slug}_mcp'
+    if not target.exists():
+        return True
+
+    values = dotenv_values(target / '.env')
+    if values.get('INTEL_MCP_DB') != dbname or values.get('MISTRAL_LIBRARY_ID', '') != (library_id or ''):
+        return True
+
+    current_documents = load_mcp_document_config(client_slug)
+    current_ids = {
+        document.get('name'): document.get('document_id')
+        for document in current_documents
+        if isinstance(document, dict)
+    }
+    expected_ids = {
+        document.get('name'): document.get('document_id')
+        for document in documents
+        if isinstance(document, dict)
+    }
+    return current_ids != expected_ids
 
 
 def choose_mcp_port():
@@ -63,6 +200,79 @@ def choose_mcp_port():
     while port in used_ports:
         port += 1
     return port
+
+
+def existing_mcp_port(client_slug):
+    env_path = MCP_ROOT / f'{client_slug}_mcp' / '.env'
+    if not env_path.exists():
+        return None
+    try:
+        return int(dotenv_values(env_path).get('MCP_PORT', ''))
+    except ValueError:
+        return None
+
+
+def is_mcp_port_open(port):
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+def stop_mcp_server(port):
+    if os.name != 'nt' or not is_mcp_port_open(port):
+        return False
+
+    result = subprocess.run(
+        ['netstat', '-ano'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    port_suffix = f':{port}'
+    for line in result.stdout.splitlines():
+        columns = line.split()
+        if len(columns) < 5 or columns[3] != 'LISTENING' or not columns[1].endswith(port_suffix):
+            continue
+        subprocess.run(['taskkill', '/PID', columns[-1], '/F'], capture_output=True, check=False)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if not is_mcp_port_open(port):
+                return True
+            time.sleep(0.15)
+    return not is_mcp_port_open(port)
+
+
+def start_client_mcp(mcp_folder, port):
+    if is_mcp_port_open(port):
+        return {'started': False, 'ready': True, 'message': 'MCP server is already running.'}
+
+    popen_options = {
+        'cwd': str(mcp_folder),
+        'stdin': subprocess.DEVNULL,
+        'stdout': subprocess.DEVNULL,
+        'stderr': subprocess.DEVNULL,
+    }
+    if os.name == 'nt':
+        popen_options['creationflags'] = subprocess.CREATE_NO_WINDOW
+
+    try:
+        subprocess.Popen([sys.executable, 'server.py'], **popen_options)
+    except OSError as exc:
+        return {'started': False, 'ready': False, 'message': f'Unable to start MCP server: {exc}'}
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if is_mcp_port_open(port):
+            return {'started': True, 'ready': True, 'message': 'MCP server started and is ready.'}
+        time.sleep(0.25)
+
+    return {
+        'started': True,
+        'ready': False,
+        'message': 'MCP process was started but did not become ready within 15 seconds.',
+    }
 
 
 def get_base_db_config(dbname='postgres'):
@@ -294,43 +504,54 @@ def write_pdf(path, filename, context):
     remember_document(context, filename, document.get('document_summary', 'Generated PDF document.'))
 
 
-def create_pdfs(client_slug, context):
-    docs_dir = GENERATED_ROOT / client_slug / 'pdfs'
+def create_pdfs(client_slug, context, filenames=None):
+    docs_dir = client_data_dir(client_slug) / 'pdfs'
     docs_dir.mkdir(parents=True, exist_ok=True)
     paths = []
-    for filename in PDF_FILES:
+    for filename in PDF_FILES if filenames is None else filenames:
         path = docs_dir / filename
-        write_pdf(path, filename, context)
+        if not path.exists() or path.stat().st_size == 0:
+            write_pdf(path, filename, context)
         paths.append(path)
     return paths
 
 
-def create_mistral_library_and_upload(client_slug, context, pdf_paths):
+def create_mistral_library_and_upload(context, pdf_paths, library_id=None, existing_documents=None):
     api_key = os.getenv('MISTRAL_API_KEY') or dotenv_values(SOURCE_MCP_DIR / '.env').get('MISTRAL_API_KEY')
     if not api_key:
-        return None, []
+        return library_id, existing_documents or [], []
 
     client = Mistral(api_key=api_key)
-    library = client.beta.libraries.create(
-        name=f'{context["client_name"]} MCP Library',
-        description=f'Synthetic manufactured credit documents for {context["client_name"]}.',
-    )
-    documents = []
-    for index, path in enumerate(pdf_paths, start=1):
+    if not library_id:
+        library = client.beta.libraries.create(
+            name=f'{context["client_name"]} MCP Library',
+            description=f'Synthetic manufactured credit documents for {context["client_name"]}.',
+        )
+        library_id = library.id
+
+    documents_by_name = {
+        document['name']: document
+        for document in existing_documents or []
+        if isinstance(document, dict) and document.get('name') and document.get('document_id')
+    }
+    uploaded_names = []
+    for path in pdf_paths:
+        if path.name in documents_by_name:
+            continue
         with path.open('rb') as handle:
             document = client.beta.libraries.documents.upload(
-                library_id=library.id,
+                library_id=library_id,
                 file={'file_name': path.name, 'content': handle, 'content_type': 'application/pdf'},
             )
-        documents.append(
-            {
-                'number': index,
-                'document_id': document.id,
-                'name': path.name,
-                'tool_name': f'get_{path.stem.lower()}_content',
-            }
-        )
-    return library.id, documents
+        documents_by_name[path.name] = {
+            'number': PDF_FILES.index(path.name) + 1,
+            'document_id': document.id,
+            'name': path.name,
+            'tool_name': f'get_{path.stem.lower()}_content',
+        }
+        uploaded_names.append(path.name)
+    documents = [documents_by_name[filename] for filename in PDF_FILES if filename in documents_by_name]
+    return library_id, documents, uploaded_names
 
 
 def generate_rows_for_table(table_name, columns, fallback_rows, context):
@@ -366,40 +587,45 @@ def generate_rows_for_table(table_name, columns, fallback_rows, context):
     return cleaned or fallback_rows
 
 
-def contextualize_seeded_tables(conn, context):
+def contextualize_seeded_tables(conn, context, seeded_tables):
     current_year = datetime.now().year
     client_id = 1001
-    conn.execute(
-        """
-        UPDATE credit_dossier.section2_customer_information
-        SET business_activities = %s,
-            business_since = %s,
-            source_document = %s
-        WHERE client_id = %s;
-        """,
-        (
-            f"{context['industry']} operations serving customers across {context['geography']} with manufactured synthetic credit records.",
-            str(context.get('incorporation_year', current_year - 8)),
-            f"Manufactured data pack for {context['client_name']}",
-            client_id,
-        ),
-    )
-    conn.execute(
-        """
-        UPDATE credit_dossier.section2_ownership_structure
-        SET owner_details = %s,
-            source_document = %s
-        WHERE client_id = %s AND ownership_id = (
-            SELECT ownership_id FROM credit_dossier.section2_ownership_structure WHERE client_id = %s ORDER BY ownership_id LIMIT 1
-        );
-        """,
-        (
-            f"{context['client_name']} Promoter Group",
-            f"Manufactured ownership records for {context['client_name']}",
-            client_id,
-            client_id,
-        ),
-    )
+    seeded_tables = set(seeded_tables)
+    if 'credit_dossier.section2_customer_information' in seeded_tables:
+        conn.execute(
+            """
+            UPDATE credit_dossier.section2_customer_information
+            SET business_activities = %s,
+                business_since = %s,
+                source_document = %s
+            WHERE client_id = %s;
+            """,
+            (
+                f"{context['industry']} operations serving customers across {context['geography']} with manufactured synthetic credit records.",
+                str(context.get('incorporation_year', current_year - 8)),
+                f"Manufactured data pack for {context['client_name']}",
+                client_id,
+            ),
+        )
+    if 'credit_dossier.section2_ownership_structure' in seeded_tables:
+        conn.execute(
+            """
+            UPDATE credit_dossier.section2_ownership_structure
+            SET owner_details = %s,
+                source_document = %s
+            WHERE client_id = %s AND ownership_id = (
+                SELECT ownership_id FROM credit_dossier.section2_ownership_structure WHERE client_id = %s ORDER BY ownership_id LIMIT 1
+            );
+            """,
+            (
+                f"{context['client_name']} Promoter Group",
+                f"Manufactured ownership records for {context['client_name']}",
+                client_id,
+                client_id,
+            ),
+        )
+    if 'credit_dossier.section3_customer_financial_information_historical' not in seeded_tables:
+        return
     historical_rows = [
         (
             client_id,
@@ -512,10 +738,47 @@ def register_backend_mcp(client_name, port):
         conn.commit()
 
 
-def seed_tables(dbname, context):
+def split_qualified_table_name(table_name):
+    return table_name.split('.', 1)
+
+
+def missing_client_tables(dbname):
+    missing = []
+    with psycopg.connect(**get_base_db_config(dbname)) as conn:
+        with conn.cursor() as cur:
+            for table_name in ALL_CLIENT_TABLE_NAMES:
+                schema_name, bare_table_name = split_qualified_table_name(table_name)
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.tables
+                        WHERE table_schema = %s AND table_name = %s
+                    );
+                    """,
+                    (schema_name, bare_table_name),
+                )
+                if not cur.fetchone()[0]:
+                    missing.append(table_name)
+                    continue
+                cur.execute(
+                    psycopg.sql.SQL('SELECT EXISTS (SELECT 1 FROM {});').format(
+                        psycopg.sql.Identifier(schema_name, bare_table_name),
+                    )
+                )
+                if not cur.fetchone()[0]:
+                    missing.append(table_name)
+    return missing
+
+
+def seed_tables(dbname, context, missing_tables):
+    missing_tables = set(missing_tables)
+    if not missing_tables:
+        return
+
     import sys
 
-    intel_path = str(ROOT_DIR / 'intel_mcp')
+    intel_path = str(SOURCE_MCP_DIR)
     shadowed_modules = [
         'database',
         'table_config',
@@ -545,18 +808,28 @@ def seed_tables(dbname, context):
                 (context['client_name'],),
             )
             for table_name, path in TABLE_FILES.items():
+                if table_name not in missing_tables:
+                    continue
                 columns, rows = read_excel(path)
                 rows = generate_rows_for_table(table_name, columns, rows, context)
                 create_table(conn, table_name, columns)
                 insert_rows(conn, table_name, columns, rows)
-            create_section2_tables(conn)
-            seed_customer_information(conn)
-            seed_ownership_structure(conn)
-            create_section3_tables(conn)
-            seed_historical_financials(conn)
-            seed_forecast(conn)
-            seed_simple_section3_tables(conn)
-            contextualize_seeded_tables(conn, context)
+            if missing_tables.intersection(SECTION2_TABLE_NAMES):
+                create_section2_tables(conn)
+                if 'credit_dossier.section2_customer_information' in missing_tables:
+                    seed_customer_information(conn)
+                if 'credit_dossier.section2_ownership_structure' in missing_tables:
+                    seed_ownership_structure(conn)
+            if missing_tables.intersection(SECTION3_TABLE_NAMES):
+                create_section3_tables(conn)
+                if 'credit_dossier.section3_customer_financial_information_historical' in missing_tables:
+                    seed_historical_financials(conn)
+                if 'credit_dossier.section3a_financial_forecast' in missing_tables:
+                    seed_forecast(conn)
+                simple_tables = set(SECTION3_TABLE_NAMES[2:])
+                if missing_tables.intersection(simple_tables):
+                    seed_simple_section3_tables(conn)
+            contextualize_seeded_tables(conn, context, missing_tables)
             conn.commit()
     finally:
         if sys.path and sys.path[0] == intel_path:
@@ -571,23 +844,55 @@ def seed_tables(dbname, context):
 def manufacture_client_data(client_name, industry, geography):
     client_slug = slugify(client_name)
     dbname = db_name_for_client(client_name)
-    context = generate_context_with_agent(client_name, industry, geography)
-    context['client_name'] = client_name
-    context['industry'] = industry
-    context['geography'] = geography
+    context = existing_or_new_context(client_slug, client_name, industry, geography)
+    context.setdefault('client_name', client_name)
+    context.setdefault('industry', industry)
+    context.setdefault('geography', geography)
 
+    existing_pdfs = existing_pdf_paths(client_slug)
+    missing_pdfs = [filename for filename in PDF_FILES if filename not in existing_pdfs]
+    generated_pdf_paths = create_pdfs(client_slug, context, missing_pdfs)
+    all_pdf_paths = [client_data_dir(client_slug) / 'pdfs' / filename for filename in PDF_FILES]
+
+    manifest = load_manifest(client_slug)
+    library_id = manifest.get('libraryId') or None
+    documents = manifest.get('documents') if isinstance(manifest.get('documents'), list) else []
+    configured_library_id, configured_documents = load_existing_mistral_assets(client_slug)
+    if not library_id:
+        library_id = configured_library_id
+    if not documents:
+        documents = configured_documents
+    missing_documents = missing_document_names(documents)
     ensure_database(dbname)
-    pdf_paths = create_pdfs(client_slug, context)
     upload_error = None
-    try:
-        library_id, documents = create_mistral_library_and_upload(client_slug, context, pdf_paths)
-    except Exception as exc:
-        library_id, documents = None, []
-        upload_error = str(exc)
-    seed_tables(dbname, context)
-    mcp_port = choose_mcp_port()
-    mcp_folder = copy_client_mcp_folder(client_slug, dbname, library_id, documents, mcp_port)
+    uploaded_document_names = []
+    if missing_documents:
+        try:
+            upload_paths = [client_data_dir(client_slug) / 'pdfs' / filename for filename in missing_documents]
+            library_id, documents, uploaded_document_names = create_mistral_library_and_upload(
+                context,
+                upload_paths,
+                library_id=library_id,
+                existing_documents=documents,
+            )
+        except Exception as exc:
+            upload_error = str(exc)
+
+    missing_tables = missing_client_tables(dbname)
+    seed_tables(dbname, context, missing_tables)
+    previous_port = existing_mcp_port(client_slug)
+    refresh_mcp = mcp_needs_refresh(client_slug, dbname, library_id, documents)
+    if refresh_mcp and previous_port:
+        stop_mcp_server(previous_port)
+    mcp_port = previous_port or choose_mcp_port()
+    mcp_folder = (
+        copy_client_mcp_folder(client_slug, dbname, library_id, documents, mcp_port)
+        if refresh_mcp
+        else MCP_ROOT / f'{client_slug}_mcp'
+    )
     register_backend_mcp(client_name, mcp_port)
+    mcp_start = start_client_mcp(mcp_folder, mcp_port)
+    save_manifest(client_slug, context, library_id, documents)
 
     return {
         'clientName': client_name,
@@ -596,10 +901,16 @@ def manufacture_client_data(client_name, industry, geography):
         'databaseName': dbname,
         'mcpFolder': str(mcp_folder),
         'mcpUrl': f'http://127.0.0.1:{mcp_port}/mcp',
-        'pdfFolder': str(GENERATED_ROOT / client_slug / 'pdfs'),
-        'pdfCount': len(pdf_paths),
+        'mcpStarted': mcp_start['started'],
+        'mcpReady': mcp_start['ready'],
+        'mcpStatus': mcp_start['message'],
+        'pdfFolder': str(client_data_dir(client_slug) / 'pdfs'),
+        'pdfCount': len(all_pdf_paths),
+        'generatedPdfCount': len(generated_pdf_paths),
         'tableCount': 16,
+        'seededTableCount': len(missing_tables),
         'mistralLibraryId': library_id,
-        'uploadedPdfCount': len(documents),
+        'uploadedPdfCount': len(uploaded_document_names),
+        'availableMistralPdfCount': len(documents),
         'uploadError': upload_error,
     }

@@ -7,6 +7,7 @@ import Login from './pages/Login.jsx';
 import ManufactureData from './pages/ManufactureData.jsx';
 import NewDeal from './pages/NewDeal.jsx';
 import NarrativesWorkspace from './pages/NarrativesWorkspace.jsx';
+import Observability from './pages/Observability.jsx';
 
 export default function App() {
   const [user, setUser] = useState(() => {
@@ -36,6 +37,7 @@ export default function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/new-deal" element={<NewDeal />} />
           <Route path="/manufacture-data" element={<ManufactureData />} />
+          <Route path="/observability" element={<Observability />} />
           <Route path="/deals/:id" element={<DealDetails />} />
           <Route path="/deals/:id/narratives" element={<NarrativesWorkspace />} />
           <Route path="*" element={<Navigate to="/" replace />} />

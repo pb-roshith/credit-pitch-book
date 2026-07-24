@@ -7,9 +7,10 @@ import json
 import os
 import re
 import secrets
+import time
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from mistralai.client import Mistral
 from pydantic import BaseModel, Field
@@ -18,6 +19,10 @@ from psycopg.rows import dict_row
 from database import get_connection, init_db
 from manufacture_data import manufacture_client_data
 from mcp_client import call_mcp_tool, list_mcp_tools
+from narrative_generation_agent import generate_narrative as run_narrative_generation_agent
+from narrative_judge import judge_narrative as run_narrative_judge_agent
+from source_discovery_agent import select_source_tools
+from telemetry import configure_telemetry, get_tracer, trace_id_from_span
 
 
 app = FastAPI(title='Credit Pitch Book API')
@@ -127,6 +132,7 @@ def row_to_narrative_section(row):
 
 
 def row_to_narrative_draft(row):
+    judge_metadata = row['judge_metadata'] or {}
     return {
         'draftId': row['draft_id'],
         'dealId': row['deal_id'],
@@ -141,12 +147,17 @@ def row_to_narrative_draft(row):
         'generationModel': row['generation_model'],
         'agentId': row['agent_id'],
         'conversationId': row['conversation_id'],
+        'otelTraceId': row.get('otel_trace_id'),
+        'sourceDiscoveryAgentId': row.get('source_discovery_agent_id'),
+        'sourceDiscoveryConversationId': row.get('source_discovery_conversation_id'),
         'judge': {
             'judgeId': row['judge_id'],
             'confidenceScore': float(row['judge_confidence_score']) if row['judge_confidence_score'] is not None else None,
             'confidencePercent': round(float(row['judge_confidence_score']) * 100) if row['judge_confidence_score'] is not None else None,
             'explanation': row['judge_explanation'],
-            'metadata': row['judge_metadata'] or {},
+            'scoreExplanation': judge_metadata.get('scoreExplanation', ''),
+            'remainingGapExplanation': judge_metadata.get('remainingGapExplanation', row['judge_explanation'] or ''),
+            'metadata': judge_metadata,
         } if row.get('judge_id') or row.get('judge_confidence_score') is not None or row.get('judge_explanation') else None,
         'draft': row['generated_output'],
         'createdAt': row['created_at'].isoformat(),
@@ -238,6 +249,247 @@ def build_docx(title, section_rows):
         docx.writestr('_rels/.rels', rels_xml)
         docx.writestr('word/document.xml', document_xml)
     return buffer.getvalue()
+
+
+def compact_observability_payload(value, limit=5):
+    if value is None:
+        return {'count': 0, 'items': []}
+
+    data = value.model_dump(mode='json') if hasattr(value, 'model_dump') else value
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        list_key = next(
+            (
+                key
+                for key, item in data.items()
+                if isinstance(item, list) and key not in {'errors'}
+            ),
+            None,
+        )
+        items = data.get(list_key, []) if list_key else []
+    else:
+        items = []
+
+    return {
+        'count': len(items),
+        'items': items[:limit],
+    }
+
+
+def safe_observability_call(label, callback, limit=5):
+    try:
+        payload = compact_observability_payload(callback(), limit=limit)
+        return {
+            'label': label,
+            'available': True,
+            **payload,
+        }
+    except Exception as exc:
+        return {
+            'label': label,
+            'available': False,
+            'count': 0,
+            'items': [],
+            'error': str(exc),
+        }
+
+
+def get_mistral_observability_snapshot():
+    api_key = os.getenv('MISTRAL_API_KEY')
+    if not api_key:
+        return {
+            'enabled': False,
+            'reason': 'MISTRAL_API_KEY is not configured.',
+            'features': [],
+        }
+
+    client = Mistral(api_key=api_key)
+    observability = client.beta.observability
+    features = [
+        safe_observability_call('Judges', lambda: observability.judges.list(page_size=10)),
+        safe_observability_call('Traces', lambda: observability.traces.search(page_size=10)),
+        safe_observability_call('Spans', lambda: observability.spans.search_spans(page_size=10)),
+        safe_observability_call('Span Evaluations', lambda: observability.spans.search_span_evaluations(page_size=10)),
+        safe_observability_call('Logs', lambda: observability.logs.search(page_size=10)),
+        safe_observability_call('Datasets', lambda: observability.datasets.list(page_size=10)),
+        safe_observability_call('Campaigns', lambda: observability.campaigns.list(page_size=10)),
+        safe_observability_call('Chat Completion Events', lambda: observability.chat_completion_events.search(search_params={}, page_size=10)),
+    ]
+    return {
+        'enabled': True,
+        'features': features,
+        'availableFeatureCount': len([feature for feature in features if feature['available']]),
+        'errorFeatureCount': len([feature for feature in features if not feature['available']]),
+    }
+
+
+def observability_model_data(value):
+    if hasattr(value, 'model_dump'):
+        return value.model_dump(mode='json')
+    return value if isinstance(value, dict) else {}
+
+
+def observability_results(value):
+    data = observability_model_data(value)
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    if isinstance(data.get('results'), list):
+        return data['results']
+    for nested_value in data.values():
+        if isinstance(nested_value, dict) and isinstance(nested_value.get('results'), list):
+            return nested_value['results']
+    return []
+
+
+def fetch_native_mistral_observability():
+    api_key = os.getenv('MISTRAL_API_KEY')
+    if not api_key:
+        return {'enabled': False, 'tracesByConversation': {}, 'spansByTrace': {}, 'error': 'MISTRAL_API_KEY is not configured.'}
+
+    client = Mistral(api_key=api_key)
+    observability = client.beta.observability
+
+    def fetch_feature(callback):
+        try:
+            return {'available': True, 'items': observability_results(callback()), 'error': None}
+        except Exception as exc:
+            return {'available': False, 'items': [], 'error': str(exc)}
+
+    trace_feature = fetch_feature(lambda: observability.traces.search(page_size=100))
+    span_feature = fetch_feature(lambda: observability.spans.search_spans(page_size=100))
+    evaluation_feature = fetch_feature(lambda: observability.spans.search_latest_span_evaluations(page_size=100))
+    log_feature = fetch_feature(lambda: observability.logs.search(page_size=100))
+    traces = trace_feature['items']
+    spans = span_feature['items']
+    evaluations = evaluation_feature['items']
+    logs = log_feature['items']
+
+    traces_by_conversation = {
+        trace['conversation_id']: trace
+        for trace in traces
+        if trace.get('conversation_id')
+    }
+    spans_by_trace = {}
+    for span in spans:
+        trace_id = span.get('trace_id')
+        if trace_id:
+            spans_by_trace.setdefault(trace_id, []).append(span)
+
+    return {
+        'enabled': any(feature['available'] for feature in (trace_feature, span_feature, evaluation_feature, log_feature)),
+        'tracesByConversation': traces_by_conversation,
+        'spansByTrace': spans_by_trace,
+        'traceCount': len(traces),
+        'spanCount': len(spans),
+        'evaluationCount': len(evaluations),
+        'logCount': len(logs),
+        'features': {
+            'traces': {'available': trace_feature['available'], 'error': trace_feature['error']},
+            'spans': {'available': span_feature['available'], 'error': span_feature['error']},
+            'evaluations': {'available': evaluation_feature['available'], 'error': evaluation_feature['error']},
+            'logs': {'available': log_feature['available'], 'error': log_feature['error']},
+        },
+        'error': next((feature['error'] for feature in (trace_feature, span_feature, evaluation_feature, log_feature) if feature['error']), None),
+    }
+
+
+def native_metric(native_trace, field, fallback=None):
+    if native_trace and native_trace.get(field) is not None:
+        return native_trace[field]
+    return fallback
+
+
+def native_duration_ms(native_trace, fallback=None):
+    duration_ns = native_metric(native_trace, 'duration_ns')
+    return round(float(duration_ns) / 1_000_000) if duration_ns is not None else fallback
+
+
+def normalize_native_spans(native_spans):
+    return [
+        {
+            'name': span.get('span_name') or span.get('operation_name') or 'Mistral span',
+            'durationMs': round(float(span['duration_ns']) / 1_000_000) if span.get('duration_ns') is not None else None,
+            'status': 'failed' if str(span.get('status_code') or '').lower() == 'error' else 'success',
+            'detail': span.get('tool_name') or span.get('request_model') or span.get('agent_name'),
+            'spanId': span.get('span_id'),
+        }
+        for span in native_spans
+    ]
+
+
+def find_otel_span(spans, span_name):
+    return next((span for span in spans if span['span_name'] == span_name), None)
+
+
+def otel_attribute(span, name, fallback=None):
+    if span and (span.get('attributes') or {}).get(name) is not None:
+        return (span.get('attributes') or {})[name]
+    return fallback
+
+
+def normalize_otel_spans(spans):
+    return [
+        {
+            'name': span['span_name'],
+            'durationMs': span['duration_ms'],
+            'status': span['status'],
+            'detail': span.get('status_message') or span.get('workflow'),
+            'spanId': span['span_id'],
+        }
+        for span in spans
+    ]
+
+
+def estimate_tokens(text):
+    if not text:
+        return 0
+    return max(1, round(len(str(text)) / 4))
+
+
+def record_observability_event(
+    event_type,
+    status,
+    deal_id=None,
+    section_number=None,
+    draft_id=None,
+    model=None,
+    latency_ms=None,
+    input_tokens=0,
+    output_tokens=0,
+    error_message=None,
+    metadata=None,
+):
+    total_tokens = (input_tokens or 0) + (output_tokens or 0)
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO ai_observability_events (
+                event_type, deal_id, section_number, draft_id, model, status,
+                latency_ms, input_tokens, output_tokens, total_tokens,
+                estimated_cost, error_message, metadata
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb);
+            """,
+            (
+                event_type,
+                deal_id,
+                section_number,
+                draft_id,
+                model,
+                status,
+                latency_ms,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                None,
+                error_message,
+                json.dumps(metadata or {}),
+            ),
+        )
+        conn.commit()
 
 
 def get_deal_row_or_404(deal_id):
@@ -630,60 +882,6 @@ def parse_agent_tool_selection(agent_text, tools):
     return []
 
 
-def run_source_discovery_agent(client, tools, section):
-    model = os.getenv('MISTRAL_GENERATION_MODEL', 'mistral-large-latest')
-    expanded_input_sources = [
-        {
-            'source': source,
-            'aliases': source_aliases(source),
-            'broadScope': is_broad_source(source),
-        }
-        for source in parse_input_sources(section['input_sources'])
-    ]
-    agent = client.beta.agents.create(
-        model=model,
-        name='Credit Pitch Book Source Discovery',
-        instructions=(
-            'You are a source discovery agent for a credit pitch book. '
-            'Choose only MCP tools from the provided list that are relevant to the requested narrative section. '
-            'Use narrative_sections.input_sources as the allowed source scope and narrative_sections.expected_output as the output target. '
-            'Return only JSON in this exact shape: {"toolNames":["tool_name"]}.'
-        ),
-        completion_args={
-            'temperature': 0.0,
-            'max_tokens': 600,
-            'response_format': {'type': 'json_object'},
-        },
-    )
-    prompt = {
-        'sectionNumber': section['section_number'],
-        'sectionName': section['section_name'],
-        'description': section['description'],
-        'inputSources': section['input_sources'],
-        'expandedInputSources': expanded_input_sources,
-        'expectedOutput': section['expected_output'],
-        'availableTools': [
-            {
-                'name': tool['name'],
-                'description': tool.get('description', ''),
-            }
-            for tool in tools
-        ],
-        'selectionRules': [
-            'Select only tools that map to the inputSources and description.',
-            'Prefer precise document content tools over generic registry or database tools.',
-            'Return 1 to 5 tool names.',
-        ],
-    }
-    response = client.beta.conversations.start(
-        agent_id=agent.id,
-        inputs=json.dumps(prompt),
-        store=False,
-    )
-    selected_tool_names = parse_agent_tool_selection(extract_beta_conversation_text(response), tools)
-    return selected_tool_names, agent.id, response.conversation_id
-
-
 async def discover_sources(registry, section):
     tools = await list_mcp_tools(registry['mcp_url'])
     scored_tools = [
@@ -698,9 +896,31 @@ async def discover_sources(registry, section):
     agent_id = None
     conversation_id = None
     selected_tool_names = []
+    input_tokens = 0
+    output_tokens = 0
+    token_usage_estimated = False
     if api_key:
-        client = Mistral(api_key=api_key)
-        selected_tool_names, agent_id, conversation_id = run_source_discovery_agent(client, tools, section)
+        expanded_input_sources = [
+            {
+                'source': source,
+                'aliases': source_aliases(source),
+                'broadScope': is_broad_source(source),
+            }
+            for source in parse_input_sources(section['input_sources'])
+        ]
+        source_discovery_result = select_source_tools(
+            api_key=api_key,
+            model=os.getenv('MISTRAL_GENERATION_MODEL', 'mistral-large-latest'),
+            section=section,
+            expanded_input_sources=expanded_input_sources,
+            tools=tools,
+        )
+        selected_tool_names = source_discovery_result['toolNames']
+        agent_id = source_discovery_result['agentId']
+        conversation_id = source_discovery_result['conversationId']
+        input_tokens = source_discovery_result['inputTokens']
+        output_tokens = source_discovery_result['outputTokens']
+        token_usage_estimated = source_discovery_result['tokenUsageEstimated']
 
     if selected_tool_names:
         tool_by_name = {tool['name']: tool for tool in scored_tools}
@@ -738,6 +958,9 @@ async def discover_sources(registry, section):
         'selectedSources': sources,
         'agentId': agent_id,
         'conversationId': conversation_id,
+        'inputTokens': input_tokens,
+        'outputTokens': output_tokens,
+        'tokenUsageEstimated': token_usage_estimated,
     }
 
 
@@ -930,6 +1153,9 @@ def store_narrative_draft(
     custom_instructions,
     output_template,
     generation_result,
+    source_discovery_agent_id=None,
+    source_discovery_conversation_id=None,
+    otel_trace_id=None,
     version_type='generated',
     edited_from_draft_id=None,
     edited_by=None,
@@ -938,14 +1164,16 @@ def store_narrative_draft(
         INSERT INTO narrative_drafts (
             deal_id, section_number, customer_name, client_match, mcp_url,
             input_sources, expected_output, custom_instructions, output_template,
-            discovered_sources, generated_output, generation_model, agent_id, conversation_id,
+            discovered_sources, generated_output, generation_model, agent_id, conversation_id, otel_trace_id,
+            source_discovery_agent_id, source_discovery_conversation_id,
             judge_id, judge_confidence_score, judge_explanation, judge_metadata,
             version_type, edited_from_draft_id, edited_by
         )
         VALUES (
             %(deal_id)s, %(section_number)s, %(customer_name)s, %(client_match)s, %(mcp_url)s,
             %(input_sources)s, %(expected_output)s, %(custom_instructions)s, %(output_template)s,
-            %(discovered_sources)s::jsonb, %(generated_output)s, %(generation_model)s, %(agent_id)s, %(conversation_id)s,
+            %(discovered_sources)s::jsonb, %(generated_output)s, %(generation_model)s, %(agent_id)s, %(conversation_id)s, %(otel_trace_id)s,
+            %(source_discovery_agent_id)s, %(source_discovery_conversation_id)s,
             %(judge_id)s, %(judge_confidence_score)s, %(judge_explanation)s, %(judge_metadata)s::jsonb,
             %(version_type)s, %(edited_from_draft_id)s, %(edited_by)s
         )
@@ -974,6 +1202,9 @@ def store_narrative_draft(
         'generation_model': generation_result.get('model'),
         'agent_id': generation_result.get('agentId'),
         'conversation_id': generation_result.get('conversationId'),
+        'otel_trace_id': otel_trace_id,
+        'source_discovery_agent_id': source_discovery_agent_id,
+        'source_discovery_conversation_id': source_discovery_conversation_id,
         'judge_id': (generation_result.get('judge') or {}).get('judgeId'),
         'judge_confidence_score': (generation_result.get('judge') or {}).get('confidenceScore'),
         'judge_explanation': (generation_result.get('judge') or {}).get('explanation'),
@@ -993,6 +1224,7 @@ def store_narrative_draft(
 @app.on_event('startup')
 def startup():
     init_db()
+    configure_telemetry()
 
 
 @app.get('/api/health')
@@ -1085,6 +1317,654 @@ def manufacture_data(payload: ManufactureDataRequest):
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get('/api/observability')
+def observability_dashboard(client_name: str | None = Query(default=None, alias='clientName')):
+    selected_client = client_name.strip() if client_name and client_name.strip() else None
+    selected_client_filter = selected_client or ''
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT legal_name AS name
+                FROM deals
+                UNION
+                SELECT customer_name AS name
+                FROM narrative_drafts
+                ORDER BY name ASC;
+                """
+            )
+            client_rows = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM deals
+                WHERE (%s::text = '' OR legal_name = %s::text);
+                """,
+                (selected_client_filter, selected_client_filter),
+            )
+            deal_count = cur.fetchone()['count']
+
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_drafts,
+                    COUNT(*) FILTER (WHERE version_type = 'generated') AS generated_drafts,
+                    COUNT(*) FILTER (WHERE version_type = 'edited') AS edited_drafts,
+                    COUNT(*) FILTER (WHERE judge_confidence_score IS NOT NULL) AS judged_drafts,
+                    COUNT(*) FILTER (WHERE judge_confidence_score IS NULL) AS unjudged_drafts,
+                    AVG(judge_confidence_score) AS average_judge_score
+                FROM narrative_drafts
+                WHERE (%s::text = '' OR customer_name = %s::text);
+                """,
+                (selected_client_filter, selected_client_filter),
+            )
+            draft_summary = cur.fetchone()
+
+            cur.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM narrative_export_versions nev
+                LEFT JOIN deals d ON d.id = nev.deal_id
+                WHERE (%s::text = '' OR d.legal_name = %s::text);
+                """,
+                (selected_client_filter, selected_client_filter),
+            )
+            export_count = cur.fetchone()['count']
+
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_requests,
+                    COUNT(*) FILTER (WHERE aoe.status = 'success') AS successful_requests,
+                    COUNT(*) FILTER (WHERE aoe.status <> 'success') AS failed_requests,
+                    AVG(latency_ms) AS average_latency_ms,
+                    SUM(input_tokens) AS input_tokens,
+                    SUM(output_tokens) AS output_tokens,
+                    SUM(total_tokens) AS total_tokens
+                FROM ai_observability_events aoe
+                LEFT JOIN deals d ON d.id = aoe.deal_id
+                LEFT JOIN narrative_drafts nd ON nd.draft_id = aoe.draft_id
+                WHERE (
+                    %s::text = ''
+                    OR d.legal_name = %s::text
+                    OR nd.customer_name = %s::text
+                );
+                """,
+                (selected_client_filter, selected_client_filter, selected_client_filter),
+            )
+            event_summary = cur.fetchone()
+
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(model, 'unknown') AS name,
+                    COUNT(*) AS count,
+                    AVG(latency_ms) AS average_latency_ms,
+                    SUM(input_tokens) AS input_tokens,
+                    SUM(output_tokens) AS output_tokens,
+                    SUM(total_tokens) AS total_tokens,
+                    COUNT(*) FILTER (WHERE aoe.status <> 'success') AS failed_requests
+                FROM ai_observability_events aoe
+                LEFT JOIN deals d ON d.id = aoe.deal_id
+                LEFT JOIN narrative_drafts nd ON nd.draft_id = aoe.draft_id
+                WHERE (
+                    %s::text = ''
+                    OR d.legal_name = %s::text
+                    OR nd.customer_name = %s::text
+                )
+                GROUP BY COALESCE(model, 'unknown')
+                ORDER BY count DESC, name ASC
+                LIMIT 8;
+                """,
+                (selected_client_filter, selected_client_filter, selected_client_filter),
+            )
+            performance_by_model_rows = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT
+                    event_type AS name,
+                    COUNT(*) AS count,
+                    AVG(latency_ms) AS average_latency_ms,
+                    SUM(input_tokens) AS input_tokens,
+                    SUM(output_tokens) AS output_tokens,
+                    SUM(total_tokens) AS total_tokens,
+                    COUNT(*) FILTER (WHERE aoe.status <> 'success') AS failed_requests
+                FROM ai_observability_events aoe
+                LEFT JOIN deals d ON d.id = aoe.deal_id
+                LEFT JOIN narrative_drafts nd ON nd.draft_id = aoe.draft_id
+                WHERE (
+                    %s::text = ''
+                    OR d.legal_name = %s::text
+                    OR nd.customer_name = %s::text
+                )
+                GROUP BY event_type
+                ORDER BY count DESC, name ASC;
+                """,
+                (selected_client_filter, selected_client_filter, selected_client_filter),
+            )
+            performance_by_use_case_rows = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT
+                    ns.section_number,
+                    ns.section_name,
+                    COUNT(nd.draft_id) AS draft_count,
+                    COUNT(nd.draft_id) FILTER (WHERE nd.version_type = 'edited') AS edited_count,
+                    COUNT(nd.draft_id) FILTER (WHERE nd.judge_confidence_score IS NOT NULL) AS judged_count,
+                    AVG(nd.judge_confidence_score) AS average_judge_score,
+                    MAX(nd.created_at) AS latest_draft_at
+                FROM narrative_sections ns
+                LEFT JOIN narrative_drafts nd
+                    ON nd.section_number = ns.section_number
+                    AND (%s::text = '' OR nd.customer_name = %s::text)
+                GROUP BY ns.section_number, ns.section_name
+                ORDER BY ns.section_number ASC;
+                """,
+                (selected_client_filter, selected_client_filter),
+            )
+            section_rows = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT
+                    nd.draft_id,
+                    nd.deal_id,
+                    nd.customer_name,
+                    nd.section_number,
+                    ns.section_name,
+                    nd.version_type,
+                    nd.input_sources,
+                    nd.expected_output,
+                    nd.custom_instructions,
+                    nd.output_template,
+                    nd.discovered_sources,
+                    nd.generated_output,
+                    nd.generation_model,
+                    nd.agent_id,
+                    nd.conversation_id,
+                    nd.otel_trace_id,
+                    nd.source_discovery_agent_id,
+                    nd.source_discovery_conversation_id,
+                    nd.judge_id,
+                    nd.judge_confidence_score,
+                    nd.judge_explanation,
+                    nd.created_at
+                FROM narrative_drafts
+                nd
+                JOIN narrative_sections ns ON ns.section_number = nd.section_number
+                WHERE (%s::text = '' OR nd.customer_name = %s::text)
+                ORDER BY created_at DESC, draft_id DESC
+                LIMIT 50;
+                """,
+                (selected_client_filter, selected_client_filter),
+            )
+            recent_drafts = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT nev.export_id, nev.deal_id, nev.filename, nev.section_count, nev.created_at
+                FROM narrative_export_versions nev
+                LEFT JOIN deals d ON d.id = nev.deal_id
+                WHERE (%s::text = '' OR d.legal_name = %s::text)
+                ORDER BY created_at DESC, export_id DESC
+                LIMIT 8;
+                """,
+                (selected_client_filter, selected_client_filter),
+            )
+            recent_exports = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT client_match, mcp_url, enabled, updated_at
+                FROM mcp_client_registry
+                ORDER BY client_match ASC;
+                """
+            )
+            mcp_rows = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT discovered_sources
+                FROM narrative_drafts
+                WHERE jsonb_array_length(discovered_sources) > 0
+                    AND (%s::text = '' OR customer_name = %s::text);
+                """,
+                (selected_client_filter, selected_client_filter),
+            )
+            source_rows = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT DISTINCT ON (aoe.draft_id)
+                    aoe.draft_id, aoe.latency_ms, aoe.input_tokens, aoe.output_tokens, aoe.total_tokens
+                FROM ai_observability_events aoe
+                LEFT JOIN narrative_drafts nd ON nd.draft_id = aoe.draft_id
+                WHERE aoe.event_type = 'narrative_generate'
+                    AND aoe.draft_id IS NOT NULL
+                    AND (%s::text = '' OR nd.customer_name = %s::text)
+                ORDER BY aoe.draft_id, aoe.created_at DESC, aoe.event_id DESC;
+                """,
+                (selected_client_filter, selected_client_filter),
+            )
+            draft_event_rows = {row['draft_id']: row for row in cur.fetchall()}
+
+            cur.execute(
+                """
+                SELECT DISTINCT ON (aoe.draft_id)
+                    aoe.draft_id, aoe.latency_ms, aoe.input_tokens, aoe.output_tokens, aoe.total_tokens
+                FROM ai_observability_events aoe
+                LEFT JOIN narrative_drafts nd ON nd.draft_id = aoe.draft_id
+                WHERE aoe.event_type = 'judge'
+                    AND aoe.draft_id IS NOT NULL
+                    AND (%s::text = '' OR nd.customer_name = %s::text)
+                ORDER BY aoe.draft_id, aoe.created_at DESC, aoe.event_id DESC;
+                """,
+                (selected_client_filter, selected_client_filter),
+            )
+            judge_event_rows = {row['draft_id']: row for row in cur.fetchall()}
+
+            cur.execute(
+                """
+                SELECT
+                    os.trace_id, os.span_id, os.parent_span_id, os.span_name, os.status,
+                    os.status_message, os.duration_ms, os.deal_id, os.section_number,
+                    os.draft_id, os.workflow, os.attributes, os.start_time
+                FROM otel_spans os
+                LEFT JOIN deals d ON d.id = os.deal_id
+                LEFT JOIN narrative_drafts nd
+                    ON nd.otel_trace_id = os.trace_id OR nd.draft_id = os.draft_id
+                WHERE (
+                    %s::text = ''
+                    OR d.legal_name = %s::text
+                    OR nd.customer_name = %s::text
+                )
+                ORDER BY os.start_time ASC;
+                """,
+                (selected_client_filter, selected_client_filter, selected_client_filter),
+            )
+            otel_span_rows = cur.fetchall()
+
+    # The dashboard is backed by locally exported OpenTelemetry spans. Existing
+    # PostgreSQL events remain a fallback for drafts created before tracing.
+    native_observability = {
+        'tracesByConversation': {},
+        'spansByTrace': {},
+    }
+    otel_spans_by_trace = {}
+    otel_spans_by_draft = {}
+    for otel_span in otel_span_rows:
+        otel_spans_by_trace.setdefault(otel_span['trace_id'], []).append(otel_span)
+        if otel_span['draft_id']:
+            otel_spans_by_draft.setdefault(otel_span['draft_id'], []).append(otel_span)
+
+    source_discovery_spans = [
+        span for span in otel_span_rows
+        if span['span_name'] == 'credit.source_discovery'
+    ]
+    source_discovery_summary = {
+        'totalRequests': len(source_discovery_spans),
+        'successfulRequests': sum(span['status'] != 'error' for span in source_discovery_spans),
+        'failedRequests': sum(span['status'] == 'error' for span in source_discovery_spans),
+        'averageLatencyMs': round(sum(span['duration_ms'] for span in source_discovery_spans) / len(source_discovery_spans))
+        if source_discovery_spans else None,
+        'inputTokens': sum(int(otel_attribute(span, 'gen_ai.usage.input_tokens', 0) or 0) for span in source_discovery_spans),
+        'outputTokens': sum(int(otel_attribute(span, 'gen_ai.usage.output_tokens', 0) or 0) for span in source_discovery_spans),
+        'retrievedSources': sum(int(otel_attribute(span, 'credit.source_count', 0) or 0) for span in source_discovery_spans),
+        'estimatedTokenUsage': any(
+            bool(otel_attribute(span, 'credit.token_usage_estimated', False))
+            for span in source_discovery_spans
+        ),
+        'agentRuns': sum(1 for row in recent_drafts if row['source_discovery_agent_id']),
+    }
+    source_discovery_summary['totalTokens'] = (
+        source_discovery_summary['inputTokens'] + source_discovery_summary['outputTokens']
+    )
+
+    event_workflows = {row['name']: row for row in performance_by_use_case_rows}
+
+    def event_workflow_summary(event_type):
+        row = event_workflows.get(event_type)
+        if not row:
+            return {
+                'totalRequests': 0,
+                'successfulRequests': 0,
+                'failedRequests': 0,
+                'averageLatencyMs': None,
+                'inputTokens': 0,
+                'outputTokens': 0,
+                'totalTokens': 0,
+            }
+        total_requests = int(row['count'] or 0)
+        failed_requests = int(row['failed_requests'] or 0)
+        return {
+            'totalRequests': total_requests,
+            'successfulRequests': total_requests - failed_requests,
+            'failedRequests': failed_requests,
+            'averageLatencyMs': round(float(row['average_latency_ms'])) if row['average_latency_ms'] is not None else None,
+            'inputTokens': int(row['input_tokens'] or 0),
+            'outputTokens': int(row['output_tokens'] or 0),
+            'totalTokens': int(row['total_tokens'] or 0),
+        }
+
+    narrative_generation_summary = event_workflow_summary('narrative_generate')
+    judge_summary = event_workflow_summary('judge')
+    workflow_summaries = [source_discovery_summary, narrative_generation_summary, judge_summary]
+    overall_request_count = sum(summary['totalRequests'] for summary in workflow_summaries)
+    overall_latency_total = sum(
+        summary['averageLatencyMs'] * summary['totalRequests']
+        for summary in workflow_summaries
+        if summary['averageLatencyMs'] is not None
+    )
+    overall_latency_count = sum(
+        summary['totalRequests']
+        for summary in workflow_summaries
+        if summary['averageLatencyMs'] is not None
+    )
+    overall_summary = {
+        'totalRequests': overall_request_count,
+        'successfulRequests': sum(summary['successfulRequests'] for summary in workflow_summaries),
+        'failedRequests': sum(summary['failedRequests'] for summary in workflow_summaries),
+        'averageLatencyMs': round(overall_latency_total / overall_latency_count) if overall_latency_count else None,
+        'inputTokens': sum(summary['inputTokens'] for summary in workflow_summaries),
+        'outputTokens': sum(summary['outputTokens'] for summary in workflow_summaries),
+    }
+    overall_summary['totalTokens'] = overall_summary['inputTokens'] + overall_summary['outputTokens']
+    source_counts = {}
+    for row in source_rows:
+        for source in row['discovered_sources'] or []:
+            tool_name = source.get('toolName')
+            if tool_name:
+                source_counts[tool_name] = source_counts.get(tool_name, 0) + 1
+
+    section_metrics = [
+        {
+            'sectionNumber': row['section_number'],
+            'sectionName': row['section_name'],
+            'draftCount': row['draft_count'],
+            'editedCount': row['edited_count'],
+            'judgedCount': row['judged_count'],
+            'averageJudgeScore': float(row['average_judge_score']) if row['average_judge_score'] is not None else None,
+            'averageJudgePercent': round(float(row['average_judge_score']) * 100) if row['average_judge_score'] is not None else None,
+            'latestDraftAt': row['latest_draft_at'].isoformat() if row['latest_draft_at'] else None,
+        }
+        for row in section_rows
+    ]
+    sections_with_drafts = len([section for section in section_metrics if section['draftCount'] > 0])
+    total_sections = len(section_metrics)
+    average_judge_score = (
+        float(draft_summary['average_judge_score'])
+        if draft_summary['average_judge_score'] is not None
+        else None
+    )
+    observability_traces = []
+    for row in recent_drafts:
+        sources = row['discovered_sources'] or []
+        citation_count = len(re.findall(r'\[Source:[^\]]+\]', row['generated_output'] or ''))
+        source_count = len(sources)
+        evaluation_score = round(float(row['judge_confidence_score']) * 100) if row['judge_confidence_score'] is not None else None
+        event_row = draft_event_rows.get(row['draft_id'])
+        judge_event_row = judge_event_rows.get(row['draft_id'])
+        native_generation_trace = native_observability['tracesByConversation'].get(row['conversation_id'])
+        native_discovery_trace = native_observability['tracesByConversation'].get(row['source_discovery_conversation_id'])
+        native_trace_id = native_generation_trace.get('trace_id') if native_generation_trace else None
+        native_spans = native_observability['spansByTrace'].get(native_trace_id, []) if native_trace_id else []
+        otel_trace_id = row['otel_trace_id']
+        otel_spans = list(otel_spans_by_trace.get(otel_trace_id, []))
+        for judge_span in otel_spans_by_draft.get(row['draft_id'], []):
+            if judge_span not in otel_spans:
+                otel_spans.append(judge_span)
+        otel_discovery_span = find_otel_span(otel_spans, 'credit.source_discovery')
+        otel_generation_span = find_otel_span(otel_spans, 'credit.mistral.narrative_generation')
+        otel_judge_span = find_otel_span(otel_spans, 'credit.mistral.judge')
+        trace_id = otel_trace_id or native_trace_id or row['conversation_id'] or f"local-draft-{row['draft_id']}"
+        workflow_metrics = {
+            'sourceDiscovery': {
+                'latencyMs': otel_discovery_span['duration_ms'] if otel_discovery_span else native_duration_ms(native_discovery_trace),
+                'inputTokens': otel_attribute(otel_discovery_span, 'gen_ai.usage.input_tokens', native_metric(native_discovery_trace, 'input_tokens')),
+                'outputTokens': otel_attribute(otel_discovery_span, 'gen_ai.usage.output_tokens', native_metric(native_discovery_trace, 'output_tokens')),
+                'tokens': (
+                    (otel_attribute(otel_discovery_span, 'gen_ai.usage.input_tokens', native_metric(native_discovery_trace, 'input_tokens')) or 0)
+                    + (otel_attribute(otel_discovery_span, 'gen_ai.usage.output_tokens', native_metric(native_discovery_trace, 'output_tokens')) or 0)
+                ) if otel_discovery_span or native_discovery_trace else None,
+                'nativeTraceId': native_discovery_trace.get('trace_id') if native_discovery_trace else None,
+                'tokenUsageEstimated': bool(otel_attribute(otel_discovery_span, 'credit.token_usage_estimated', False)),
+            },
+            'narrativeGenerate': {
+                'latencyMs': otel_generation_span['duration_ms'] if otel_generation_span else native_duration_ms(native_generation_trace, event_row['latency_ms'] if event_row else None),
+                'inputTokens': otel_attribute(otel_generation_span, 'gen_ai.usage.input_tokens', native_metric(native_generation_trace, 'input_tokens', event_row['input_tokens'] if event_row else None)),
+                'outputTokens': otel_attribute(otel_generation_span, 'gen_ai.usage.output_tokens', native_metric(native_generation_trace, 'output_tokens', event_row['output_tokens'] if event_row else None)),
+                'tokens': (
+                    (otel_attribute(otel_generation_span, 'gen_ai.usage.input_tokens', native_metric(native_generation_trace, 'input_tokens')) or 0)
+                    + (otel_attribute(otel_generation_span, 'gen_ai.usage.output_tokens', native_metric(native_generation_trace, 'output_tokens')) or 0)
+                ) if otel_generation_span or native_generation_trace else (event_row['total_tokens'] if event_row else None),
+                'nativeTraceId': native_trace_id,
+            },
+            'judge': {
+                'latencyMs': otel_judge_span['duration_ms'] if otel_judge_span else (judge_event_row['latency_ms'] if judge_event_row else None),
+                'inputTokens': otel_attribute(otel_judge_span, 'gen_ai.usage.input_tokens', judge_event_row['input_tokens'] if judge_event_row else None),
+                'outputTokens': otel_attribute(otel_judge_span, 'gen_ai.usage.output_tokens', judge_event_row['output_tokens'] if judge_event_row else None),
+                'tokens': (
+                    (otel_attribute(otel_judge_span, 'gen_ai.usage.input_tokens') or 0)
+                    + (otel_attribute(otel_judge_span, 'gen_ai.usage.output_tokens') or 0)
+                ) if otel_judge_span else (judge_event_row['total_tokens'] if judge_event_row else None),
+                'nativeTraceId': None,
+            },
+        }
+        observability_traces.append(
+            {
+                'id': f"draft-{row['draft_id']}",
+                'draftId': row['draft_id'],
+                'userQuery': f"Generate Section {row['section_number']} narrative for {row['customer_name']}",
+                'agentFlow': 'Source Discovery -> Retrieval -> Prompt Construction -> Mistral Agent Call -> Final Generation -> Save Draft',
+                'mistralTraceId': trace_id,
+                'traceId': trace_id,
+                'latencyMs': workflow_metrics['narrativeGenerate']['latencyMs'],
+                'model': row['generation_model'],
+                'tokens': workflow_metrics['narrativeGenerate']['tokens'],
+                'inputTokens': workflow_metrics['narrativeGenerate']['inputTokens'],
+                'outputTokens': workflow_metrics['narrativeGenerate']['outputTokens'],
+                'status': 'failed' if any(span['status'] == 'error' for span in otel_spans) or str((native_generation_trace or {}).get('status_code', '')).lower() == 'error' else 'success',
+                'evaluationScore': evaluation_score,
+                'feedback': row['judge_explanation'],
+                'timestamp': row['created_at'].isoformat(),
+                'sectionNumber': row['section_number'],
+                'sectionName': row['section_name'],
+                'customer': row['customer_name'],
+                'spans': [
+                    {'name': 'User Request', 'durationMs': None, 'status': 'success'},
+                    {'name': 'Source Discovery', 'durationMs': None, 'status': 'success'},
+                    {'name': 'Retrieval', 'durationMs': None, 'status': 'success', 'detail': f'{source_count} sources'},
+                    {'name': 'Prompt Construction', 'durationMs': None, 'status': 'success'},
+                    {'name': 'Mistral Agent Call', 'durationMs': None, 'status': 'success', 'detail': row['agent_id']},
+                    {'name': 'Tool Call', 'durationMs': None, 'status': 'success'},
+                    {'name': 'Final Generation', 'durationMs': None, 'status': 'success'},
+                    {'name': 'Evaluation', 'durationMs': None, 'status': 'success' if evaluation_score is not None else 'not_run'},
+                    {'name': 'Feedback', 'durationMs': None, 'status': 'available' if row['judge_explanation'] else 'not_available'},
+                ],
+                'nativeSpans': normalize_native_spans(native_spans),
+                'otelSpans': normalize_otel_spans(otel_spans),
+                'rag': {
+                    'retrievedDocuments': [
+                        {
+                            'name': source.get('toolName'),
+                            'sourceSystem': 'Postgres' if str(source.get('toolName', '')).startswith('fetch_credit_table_rows:') else 'Mistral PDF Library',
+                            'chunkScore': source.get('score'),
+                        }
+                        for source in sources
+                    ],
+                    'citationCoveragePercent': round((citation_count / max(source_count, 1)) * 100) if source_count else 0,
+                    'unsupportedClaimsCount': None,
+                    'relevanceScore': evaluation_score,
+                    'groundednessScore': evaluation_score,
+                },
+                'audit': {
+                    'originalUserRequest': f"Generate Section {row['section_number']} narrative for {row['customer_name']}",
+                    'retrievedSources': sources,
+                    'finalPrompt': {
+                        'section': row['section_name'],
+                        'inputSources': row['input_sources'],
+                        'expectedOutput': row['expected_output'],
+                        'customInstructions': row['custom_instructions'] or '',
+                        'outputTemplate': row['output_template'] or '',
+                    },
+                    'mistralResponse': row['generated_output'],
+                    'citations': re.findall(r'\[Source:[^\]]+\]', row['generated_output'] or ''),
+                    'evaluationScores': {
+                        'judgeConfidencePercent': evaluation_score,
+                    },
+                    'metrics': workflow_metrics,
+                    'sourceDiscovery': {
+                        'agentId': row['source_discovery_agent_id'],
+                        'conversationId': row['source_discovery_conversation_id'],
+                        'selectedSourceCount': source_count,
+                        'tokenUsageEstimated': workflow_metrics['sourceDiscovery']['tokenUsageEstimated'],
+                    },
+                    'openTelemetry': {
+                        'available': bool(otel_spans),
+                        'traceId': otel_trace_id,
+                        'spanCount': len(otel_spans),
+                    },
+                    'nativeMistral': {
+                        'available': bool(native_generation_trace),
+                        'traceId': native_trace_id,
+                        'conversationId': row['conversation_id'],
+                        'sourceDiscoveryTraceId': workflow_metrics['sourceDiscovery']['nativeTraceId'],
+                        'spanCount': len(native_spans),
+                        'agentId': row['agent_id'],
+                        'sourceDiscoveryAgentId': row['source_discovery_agent_id'],
+                    },
+                    'userFeedback': None,
+                    'traceId': trace_id,
+                    'timestamp': row['created_at'].isoformat(),
+                },
+            }
+        )
+    top_use_cases = [
+        {'name': section['sectionName'], 'count': section['draftCount']}
+        for section in sorted(section_metrics, key=lambda item: item['draftCount'], reverse=True)[:5]
+        if section['draftCount'] > 0
+    ]
+    top_models = {}
+    for row in recent_drafts:
+        if row['generation_model']:
+            top_models[row['generation_model']] = top_models.get(row['generation_model'], 0) + 1
+
+    return {
+        'summary': {
+            'dealCount': deal_count,
+            'totalSections': total_sections,
+            'sectionsWithDrafts': sections_with_drafts,
+            'sectionCoveragePercent': round((sections_with_drafts / total_sections) * 100) if total_sections else 0,
+            'totalDrafts': draft_summary['total_drafts'],
+            'generatedDrafts': draft_summary['generated_drafts'],
+            'editedDrafts': draft_summary['edited_drafts'],
+            'judgedDrafts': draft_summary['judged_drafts'],
+            'unjudgedDrafts': draft_summary['unjudged_drafts'],
+            'totalRequests': overall_summary['totalRequests'],
+            'successfulRequests': overall_summary['successfulRequests'],
+            'failedRequests': overall_summary['failedRequests'],
+            'averageLatencyMs': overall_summary['averageLatencyMs'],
+            'totalTokens': overall_summary['totalTokens'],
+            'inputTokens': overall_summary['inputTokens'],
+            'outputTokens': overall_summary['outputTokens'],
+            'averageJudgeScore': average_judge_score,
+            'averageJudgePercent': round(average_judge_score * 100) if average_judge_score is not None else None,
+            'averageEvaluationScore': round(average_judge_score * 100) if average_judge_score is not None else None,
+            'sourceDiscovery': source_discovery_summary,
+            'narrativeGeneration': narrative_generation_summary,
+            'judge': judge_summary,
+            'exportCount': export_count,
+            'mcpClientCount': len(mcp_rows),
+            'topUseCases': top_use_cases,
+            'topModels': [
+                {'name': name, 'count': count}
+                for name, count in sorted(top_models.items(), key=lambda item: item[1], reverse=True)[:5]
+            ],
+            'performanceByModel': [
+                {
+                    'name': row['name'],
+                    'count': row['count'],
+                    'averageLatencyMs': round(float(row['average_latency_ms'])) if row['average_latency_ms'] is not None else None,
+                    'inputTokens': int(row['input_tokens']) if row['input_tokens'] is not None else 0,
+                    'outputTokens': int(row['output_tokens']) if row['output_tokens'] is not None else 0,
+                    'totalTokens': int(row['total_tokens']) if row['total_tokens'] is not None else 0,
+                    'failedRequests': row['failed_requests'],
+                }
+                for row in performance_by_model_rows
+            ],
+            'performanceByUseCase': [
+                {
+                    'name': 'Source Discovery',
+                    'count': source_discovery_summary['totalRequests'],
+                    'averageLatencyMs': source_discovery_summary['averageLatencyMs'],
+                    'inputTokens': source_discovery_summary['inputTokens'],
+                    'outputTokens': source_discovery_summary['outputTokens'],
+                    'totalTokens': source_discovery_summary['totalTokens'],
+                    'failedRequests': source_discovery_summary['failedRequests'],
+                }
+            ] + [
+                {
+                    'name': row['name'],
+                    'count': row['count'],
+                    'averageLatencyMs': round(float(row['average_latency_ms'])) if row['average_latency_ms'] is not None else None,
+                    'inputTokens': int(row['input_tokens']) if row['input_tokens'] is not None else 0,
+                    'outputTokens': int(row['output_tokens']) if row['output_tokens'] is not None else 0,
+                    'totalTokens': int(row['total_tokens']) if row['total_tokens'] is not None else 0,
+                    'failedRequests': row['failed_requests'],
+                }
+                for row in performance_by_use_case_rows
+            ],
+        },
+        'traces': observability_traces,
+        'clients': [row['name'] for row in client_rows if row['name']],
+        'selectedClient': selected_client,
+        'sections': section_metrics,
+        'topSources': [
+            {'toolName': tool_name, 'count': count}
+            for tool_name, count in sorted(source_counts.items(), key=lambda item: item[1], reverse=True)[:12]
+        ],
+        'recentDrafts': [
+            {
+                'draftId': row['draft_id'],
+                'dealId': row['deal_id'],
+                'customer': row['customer_name'],
+                'sectionNumber': row['section_number'],
+                'versionType': row['version_type'],
+                'judgeConfidencePercent': round(float(row['judge_confidence_score']) * 100) if row['judge_confidence_score'] is not None else None,
+                'createdAt': row['created_at'].isoformat(),
+            }
+            for row in recent_drafts
+        ],
+        'recentExports': [
+            {
+                'exportId': row['export_id'],
+                'dealId': row['deal_id'],
+                'filename': row['filename'],
+                'sectionCount': row['section_count'],
+                'createdAt': row['created_at'].isoformat(),
+            }
+            for row in recent_exports
+        ],
+        'mcpClients': [
+            {
+                'clientMatch': row['client_match'],
+                'mcpUrl': row['mcp_url'],
+                'enabled': row['enabled'],
+                'updatedAt': row['updated_at'].isoformat(),
+            }
+            for row in mcp_rows
+        ],
+        'mistralObservability': get_mistral_observability_snapshot(),
+        'openTelemetry': {
+            'enabled': True,
+            'spanCount': len(otel_span_rows),
+        },
+    }
 
 
 @app.post('/api/deals', status_code=status.HTTP_201_CREATED)
@@ -1185,24 +2065,96 @@ async def generate_narrative(deal_id: int, section_number: int, payload: Narrati
 
 
 async def generate_narrative_for_section(deal_id, deal, registry, section, payload):
-    discovery = await discover_sources(registry, section)
-    generation_result = generate_narrative_text(
-        deal=deal,
-        section=section,
-        discovered_sources=discovery['selectedSources'],
-        custom_instructions=payload.customInstructions,
-        output_template=payload.outputTemplate,
-    )
-    draft_row = store_narrative_draft(
-        deal=deal,
-        registry=registry,
-        section=section,
-        discovered_sources=discovery['selectedSources'],
-        custom_instructions=payload.customInstructions,
-        output_template=payload.outputTemplate,
-        generation_result=generation_result,
-        edited_by=payload.username or None,
-    )
+    started_at = time.perf_counter()
+    draft_row = None
+    generation_result = {}
+    tracer = get_tracer()
+    with tracer.start_as_current_span(
+        'credit.narrative.generate',
+        attributes={
+            'credit.workflow': 'narrative_generation',
+            'credit.deal_id': deal_id,
+            'credit.section_number': section['section_number'],
+            'credit.client': deal['legal_name'],
+        },
+    ) as root_span:
+        otel_trace_id = trace_id_from_span(root_span)
+        try:
+            with tracer.start_as_current_span('credit.source_discovery') as span:
+                discovery = await discover_sources(registry, section)
+                span.set_attribute('credit.source_count', len(discovery['selectedSources']))
+                span.set_attribute('credit.mcp_url', registry['mcp_url'])
+                span.set_attribute('gen_ai.usage.input_tokens', discovery['inputTokens'])
+                span.set_attribute('gen_ai.usage.output_tokens', discovery['outputTokens'])
+                span.set_attribute('credit.token_usage_estimated', discovery['tokenUsageEstimated'])
+                span.set_attribute('credit.agent_id', discovery['agentId'] or '')
+                span.set_attribute('credit.conversation_id', discovery['conversationId'] or '')
+
+            with tracer.start_as_current_span('credit.prompt_construction') as span:
+                source_text = '\n\n'.join(source.get('text', '') for source in discovery['selectedSources'])
+                input_tokens = estimate_tokens(source_text) + estimate_tokens(payload.customInstructions) + estimate_tokens(payload.outputTemplate)
+                span.set_attribute('credit.source_count', len(discovery['selectedSources']))
+                span.set_attribute('gen_ai.usage.input_tokens', input_tokens)
+                span.set_attribute('credit.custom_instructions', bool(payload.customInstructions.strip()))
+                span.set_attribute('credit.output_template', bool(payload.outputTemplate.strip()))
+
+            with tracer.start_as_current_span('credit.mistral.narrative_generation') as span:
+                generation_result = run_narrative_generation_agent(
+                    api_key=os.getenv('MISTRAL_API_KEY'),
+                    model=os.getenv('MISTRAL_GENERATION_MODEL', 'mistral-large-latest'),
+                    deal=deal,
+                    section=section,
+                    discovered_sources=discovery['selectedSources'],
+                    custom_instructions=payload.customInstructions,
+                    output_template=payload.outputTemplate,
+                )
+                output_tokens = estimate_tokens(generation_result.get('draft', ''))
+                span.set_attribute('gen_ai.request.model', generation_result.get('model') or 'unknown')
+                span.set_attribute('gen_ai.usage.input_tokens', input_tokens)
+                span.set_attribute('gen_ai.usage.output_tokens', output_tokens)
+                span.set_attribute('credit.mistral_conversation_id', generation_result.get('conversationId') or '')
+
+            with tracer.start_as_current_span('credit.postgres.save_draft'):
+                draft_row = store_narrative_draft(
+                    deal=deal,
+                    registry=registry,
+                    section=section,
+                    discovered_sources=discovery['selectedSources'],
+                    custom_instructions=payload.customInstructions,
+                    output_template=payload.outputTemplate,
+                    generation_result=generation_result,
+                    source_discovery_agent_id=discovery.get('agentId'),
+                    source_discovery_conversation_id=discovery.get('conversationId'),
+                    otel_trace_id=otel_trace_id,
+                    edited_by=payload.username or None,
+                )
+
+            root_span.set_attribute('credit.draft_id', draft_row['draft_id'])
+            root_span.set_attribute('credit.source_count', len(discovery['selectedSources']))
+            record_observability_event(
+                event_type='narrative_generate',
+                status='success',
+                deal_id=deal_id,
+                section_number=section['section_number'],
+                draft_id=draft_row['draft_id'],
+                model=generation_result.get('model'),
+                latency_ms=round((time.perf_counter() - started_at) * 1000),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                metadata={'sourceCount': len(discovery['selectedSources']), 'otelTraceId': otel_trace_id},
+            )
+        except Exception as exc:
+            record_observability_event(
+                event_type='narrative_generate',
+                status='failed',
+                deal_id=deal_id,
+                section_number=section['section_number'],
+                model=generation_result.get('model'),
+                latency_ms=round((time.perf_counter() - started_at) * 1000),
+                error_message=str(exc),
+                metadata={'otelTraceId': otel_trace_id},
+            )
+            raise
     return {
         'dealId': deal_id,
         'customer': deal['legal_name'],
@@ -1316,6 +2268,7 @@ async def generate_all_narratives(deal_id: int, payload: NarrativeBulkGenerateRe
 
 @app.post('/api/deals/{deal_id}/narratives/{section_number}/judge')
 async def run_narrative_judge(deal_id: int, section_number: int, payload: NarrativeJudgeRequest):
+    started_at = time.perf_counter()
     deal, registry = get_deal_mcp_context_or_403(deal_id)
     section = get_narrative_section_or_404(section_number)
 
@@ -1380,12 +2333,43 @@ async def run_narrative_judge(deal_id: int, section_number: int, payload: Narrat
     if not discovered_sources:
         raise HTTPException(status_code=422, detail='No source content is available to judge this draft.')
 
-    judge_result = judge_narrative_relevance(
-        deal=deal,
-        section=section,
-        discovered_sources=discovered_sources,
-        draft=draft_row['generated_output'],
-    )
+    source_text = '\n\n'.join(source.get('text', '') for source in discovered_sources)
+    judge_input_tokens = estimate_tokens(source_text) + estimate_tokens(draft_row['generated_output'])
+    tracer = get_tracer()
+    try:
+        with tracer.start_as_current_span(
+            'credit.mistral.judge',
+            attributes={
+                'credit.workflow': 'narrative_judge',
+                'credit.deal_id': deal_id,
+                'credit.section_number': section_number,
+                'credit.draft_id': draft_row['draft_id'],
+                'credit.client': deal['legal_name'],
+                'gen_ai.usage.input_tokens': judge_input_tokens,
+            },
+        ) as span:
+            judge_result = run_narrative_judge_agent(
+                api_key=os.getenv('MISTRAL_API_KEY'),
+                model=os.getenv('MISTRAL_JUDGE_MODEL', os.getenv('MISTRAL_GENERATION_MODEL', 'mistral-large-latest')),
+                deal=deal,
+                section=section,
+                discovered_sources=discovered_sources,
+                draft=draft_row['generated_output'],
+            )
+            span.set_attribute('gen_ai.usage.output_tokens', estimate_tokens((judge_result or {}).get('explanation', '')))
+            span.set_attribute('credit.judge_id', (judge_result or {}).get('judgeId') or '')
+    except Exception as exc:
+        record_observability_event(
+            event_type='judge',
+            status='failed',
+            deal_id=deal_id,
+            section_number=section_number,
+            draft_id=draft_row['draft_id'],
+            model=os.getenv('MISTRAL_JUDGE_MODEL', os.getenv('MISTRAL_GENERATION_MODEL', 'mistral-large-latest')),
+            latency_ms=round((time.perf_counter() - started_at) * 1000),
+            error_message=str(exc),
+        )
+        raise
 
     with get_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -1410,11 +2394,25 @@ async def run_narrative_judge(deal_id: int, section_number: int, payload: Narrat
             updated_row = cur.fetchone()
             conn.commit()
 
+    record_observability_event(
+        event_type='judge',
+        status='success' if (judge_result or {}).get('confidenceScore') is not None else 'failed',
+        deal_id=deal_id,
+        section_number=section_number,
+        draft_id=draft_row['draft_id'],
+        model=(judge_result or {}).get('metadata', {}).get('model'),
+        latency_ms=round((time.perf_counter() - started_at) * 1000),
+        input_tokens=judge_input_tokens,
+        output_tokens=estimate_tokens((judge_result or {}).get('explanation', '')),
+        error_message=(judge_result or {}).get('metadata', {}).get('error'),
+        metadata={'confidenceScore': (judge_result or {}).get('confidenceScore')},
+    )
     return row_to_narrative_draft(updated_row)
 
 
 @app.post('/api/deals/{deal_id}/narratives/export')
 def export_narrative_drafts(deal_id: int, payload: NarrativeExportRequest):
+    started_at = time.perf_counter()
     deal = get_deal_row_or_404(deal_id)
 
     with get_connection() as conn:
@@ -1497,6 +2495,15 @@ def export_narrative_drafts(deal_id: int, payload: NarrativeExportRequest):
             cur.fetchone()
             conn.commit()
 
+    record_observability_event(
+        event_type='export',
+        status='success',
+        deal_id=deal_id,
+        latency_ms=round((time.perf_counter() - started_at) * 1000),
+        input_tokens=estimate_tokens('\n\n'.join(content for _, content in section_rows)),
+        output_tokens=0,
+        metadata={'sectionCount': exported_count, 'filename': filename},
+    )
     return Response(
         content=docx_content,
         media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',

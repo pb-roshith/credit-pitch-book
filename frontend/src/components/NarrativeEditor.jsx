@@ -26,6 +26,7 @@ export default function NarrativeEditor({ deal, section, selectedDraftId, onSele
   const [showModerationDetails, setShowModerationDetails] = useState(false);
   const [judgeResult, setJudgeResult] = useState(null);
   const [showJudgeDetails, setShowJudgeDetails] = useState(false);
+  const [judgeExplanationMode, setJudgeExplanationMode] = useState('score');
   const inputSources = section.inputSources
     ? section.inputSources.split(',').map((source) => source.trim()).filter(Boolean)
     : [];
@@ -183,6 +184,7 @@ export default function NarrativeEditor({ deal, section, selectedDraftId, onSele
     setModerationDetails([]);
     setShowModerationDetails(false);
     setShowJudgeDetails(false);
+    setJudgeExplanationMode('score');
     loadVersions().catch((err) => setError(err.message));
   }, [deal.id, section.sectionNumber]);
 
@@ -194,6 +196,7 @@ export default function NarrativeEditor({ deal, section, selectedDraftId, onSele
     setModerationDetails([]);
     setShowModerationDetails(false);
     setShowJudgeDetails(false);
+    setJudgeExplanationMode('score');
 
     try {
       const result = await generateNarrative(deal.id, section.sectionNumber, {
@@ -276,6 +279,7 @@ export default function NarrativeEditor({ deal, section, selectedDraftId, onSele
     setRunningJudge(true);
     setError('');
     setShowJudgeDetails(false);
+    setJudgeExplanationMode('score');
 
     try {
       const result = await runNarrativeJudge(deal.id, section.sectionNumber, {
@@ -482,25 +486,51 @@ export default function NarrativeEditor({ deal, section, selectedDraftId, onSele
               </button>
             </div>
           </div>
-          {judgeResult?.explanation && (
+          {(judgeResult?.scoreExplanation || judgeResult?.remainingGapExplanation || judgeResult?.explanation) && (
             <div className="mt-3 overflow-hidden rounded-lg border border-slate-200">
               <button
                 type="button"
                 onClick={() => setShowJudgeDetails((current) => !current)}
                 className="flex w-full items-center justify-between gap-3 bg-slate-50 px-4 py-3 text-left text-sm font-bold text-slate-700"
               >
-                <span>Judge explanation for remaining gap</span>
+                <span>Judge explanation</span>
                 <span>{showJudgeDetails ? 'Collapse' : 'Expand'}</span>
               </button>
               {showJudgeDetails && (
-                <ul className="space-y-2 px-5 py-4 text-sm leading-6 text-slate-600">
-                  {getJudgePoints(judgeResult.explanation).map((point, index) => (
-                    <li key={`${point}-${index}`} className="flex gap-2">
-                      <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-[#003A8C]" />
-                      <span>{point}</span>
-                    </li>
-                  ))}
-                </ul>
+                <div className="px-4 py-4">
+                  <div className="inline-flex rounded-lg border border-slate-300 bg-white p-1">
+                    <button
+                      type="button"
+                      onClick={() => setJudgeExplanationMode('score')}
+                      className={`rounded-md px-3 py-2 text-xs font-bold ${
+                        judgeExplanationMode === 'score' ? 'bg-[#003A8C] text-white' : 'text-slate-600'
+                      }`}
+                    >
+                      Score explanation ({judgeResult?.confidencePercent ?? 0}%)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setJudgeExplanationMode('gap')}
+                      className={`rounded-md px-3 py-2 text-xs font-bold ${
+                        judgeExplanationMode === 'gap' ? 'bg-[#003A8C] text-white' : 'text-slate-600'
+                      }`}
+                    >
+                      Remaining gap ({Math.max(0, 100 - (judgeResult?.confidencePercent || 0))}%)
+                    </button>
+                  </div>
+                  <ul className="mt-4 space-y-2 text-sm leading-6 text-slate-600">
+                    {getJudgePoints(
+                      judgeExplanationMode === 'score'
+                        ? (judgeResult?.scoreExplanation || judgeResult?.metadata?.scoreExplanation || judgeResult?.explanation)
+                        : (judgeResult?.remainingGapExplanation || judgeResult?.metadata?.remainingGapExplanation || judgeResult?.explanation),
+                    ).map((point, index) => (
+                      <li key={`${point}-${index}`} className="flex gap-2">
+                        <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-[#003A8C]" />
+                        <span>{point}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
             </div>
           )}

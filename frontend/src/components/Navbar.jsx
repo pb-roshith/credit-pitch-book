@@ -1,4 +1,4 @@
-import { BookOpen, Factory, FileText, LayoutDashboard, LogOut, PlusCircle, UserCircle } from 'lucide-react';
+import { Activity, BookOpen, Factory, FileText, LayoutDashboard, LogOut, PlusCircle, UserCircle } from 'lucide-react';
 import { Link, NavLink } from 'react-router-dom';
 
 const navClass = ({ isActive }) =>
@@ -29,6 +29,10 @@ export default function Navbar({ user, onLogout }) {
             <NavLink to="/manufacture-data" className={navClass}>
               <Factory size={17} />
               Manufacture Data
+            </NavLink>
+            <NavLink to="/observability" className={navClass}>
+              <Activity size={17} />
+              Observability
             </NavLink>
           </nav>
         </div>

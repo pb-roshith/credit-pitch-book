@@ -92,6 +92,9 @@ def init_db():
         generation_model TEXT,
         agent_id TEXT,
         conversation_id TEXT,
+        otel_trace_id TEXT,
+        source_discovery_agent_id TEXT,
+        source_discovery_conversation_id TEXT,
         judge_id TEXT,
         judge_confidence_score NUMERIC(5, 2),
         judge_explanation TEXT,
@@ -113,6 +116,47 @@ def init_db():
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """
+    create_ai_observability_events_table_sql = """
+    CREATE TABLE IF NOT EXISTS ai_observability_events (
+        event_id BIGSERIAL PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        deal_id BIGINT REFERENCES deals(id) ON DELETE CASCADE,
+        section_number INTEGER,
+        draft_id BIGINT REFERENCES narrative_drafts(draft_id) ON DELETE SET NULL,
+        model TEXT,
+        status TEXT NOT NULL,
+        latency_ms INTEGER,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        total_tokens INTEGER,
+        estimated_cost NUMERIC(18, 6),
+        error_message TEXT,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """
+    create_otel_spans_table_sql = """
+    CREATE TABLE IF NOT EXISTS otel_spans (
+        span_row_id BIGSERIAL PRIMARY KEY,
+        trace_id TEXT NOT NULL,
+        span_id TEXT NOT NULL,
+        parent_span_id TEXT,
+        span_name TEXT NOT NULL,
+        span_kind TEXT,
+        status TEXT NOT NULL,
+        status_message TEXT,
+        start_time TIMESTAMPTZ NOT NULL,
+        end_time TIMESTAMPTZ NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        deal_id BIGINT REFERENCES deals(id) ON DELETE SET NULL,
+        section_number INTEGER,
+        draft_id BIGINT REFERENCES narrative_drafts(draft_id) ON DELETE SET NULL,
+        workflow TEXT,
+        attributes JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (trace_id, span_id)
+    );
+    """
     with get_connection() as conn:
         conn.execute(create_users_table_sql)
         conn.execute(create_deals_table_sql)
@@ -120,10 +164,15 @@ def init_db():
         conn.execute(create_mcp_registry_table_sql)
         conn.execute(create_narrative_drafts_table_sql)
         conn.execute(create_narrative_export_versions_table_sql)
+        conn.execute(create_ai_observability_events_table_sql)
+        conn.execute(create_otel_spans_table_sql)
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS version_type TEXT NOT NULL DEFAULT 'generated';")
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS edited_from_draft_id BIGINT REFERENCES narrative_drafts(draft_id) ON DELETE SET NULL;")
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS edited_by TEXT;")
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS judge_id TEXT;")
+        conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS source_discovery_agent_id TEXT;")
+        conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS source_discovery_conversation_id TEXT;")
+        conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS otel_trace_id TEXT;")
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS judge_confidence_score NUMERIC(5, 2);")
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS judge_explanation TEXT;")
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS judge_metadata JSONB NOT NULL DEFAULT '{}'::jsonb;")

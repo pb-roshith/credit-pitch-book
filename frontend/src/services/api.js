@@ -134,3 +134,8 @@ export function manufactureData(payload) {
     body: JSON.stringify(payload),
   });
 }
+
+export function fetchObservability(clientName = '') {
+  const query = clientName ? `?clientName=${encodeURIComponent(clientName)}` : '';
+  return request(`/observability${query}`);
+}

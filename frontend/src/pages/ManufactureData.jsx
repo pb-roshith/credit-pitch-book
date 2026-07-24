@@ -109,15 +109,23 @@ export default function ManufactureData() {
               <p className="text-xs font-bold uppercase tracking-wide text-slate-500">MCP URL</p>
               <p className="mt-1 break-all font-mono text-sm font-semibold text-slate-800">{result.mcpUrl}</p>
             </div>
+            <div className={`rounded-lg border p-4 ${result.mcpReady ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'}`}>
+              <p className="text-xs font-bold uppercase tracking-wide text-slate-500">MCP Status</p>
+              <p className={`mt-1 text-sm font-semibold ${result.mcpReady ? 'text-emerald-700' : 'text-amber-700'}`}>
+                {result.mcpStatus || 'MCP status was not returned.'}
+              </p>
+            </div>
             <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
               <p className="text-xs font-bold uppercase tracking-wide text-slate-500">PDFs</p>
               <p className="mt-1 text-sm font-semibold text-slate-800">
-                {result.pdfCount} generated / {result.uploadedPdfCount} uploaded
+                {result.generatedPdfCount ?? result.pdfCount} generated this run / {result.pdfCount} available
               </p>
             </div>
             <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
               <p className="text-xs font-bold uppercase tracking-wide text-slate-500">Tables</p>
-              <p className="mt-1 text-sm font-semibold text-slate-800">{result.tableCount} seeded</p>
+              <p className="mt-1 text-sm font-semibold text-slate-800">
+                {result.seededTableCount ?? result.tableCount} seeded this run / {result.tableCount} available
+              </p>
             </div>
           </div>
           {result.mistralLibraryId && (
