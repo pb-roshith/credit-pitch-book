@@ -6,6 +6,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -20,11 +21,13 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from financial_table_schema import FINANCIAL_TABLE_NAMES, FINANCIAL_TABLES
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 MCP_ROOT = ROOT_DIR / 'mcp'
-SOURCE_MCP_DIR = MCP_ROOT / 'intel_mcp'
-GENERATED_ROOT = ROOT_DIR / 'generated_manufactured_data'
+MCP_TEMPLATE_DIR = MCP_ROOT / 'client_template'
+SHARED_MCP_DIR = MCP_ROOT / 'shared_mcp'
+LEGACY_SOURCE_MCP_DIR = MCP_ROOT / 'intel_mcp'
 
 PDF_FILES = [
     'Asset_Details.pdf',
@@ -46,14 +49,7 @@ PDF_FILES = [
     'Purpose_of_Loan.pdf',
 ]
 
-EXCEL_TABLE_NAMES = (
-    'credit_dossier.credit_balance_sheet',
-    'credit_dossier.credit_cashflow_statement',
-    'credit_dossier.credit_income_statement',
-    'credit_dossier.credit_bank_statements',
-    'credit_dossier.credit_net_worth_statement',
-    'credit_dossier.credit_projected_financials',
-)
+EXCEL_TABLE_NAMES = FINANCIAL_TABLE_NAMES
 SECTION2_TABLE_NAMES = (
     'credit_dossier.section2_customer_information',
     'credit_dossier.section2_ownership_structure',
@@ -80,44 +76,18 @@ def db_name_for_client(client_name):
     return f'{slugify(client_name)}_mcp_db'
 
 
-def client_data_dir(client_slug):
-    return GENERATED_ROOT / client_slug
-
-
-def manifest_path(client_slug):
-    return client_data_dir(client_slug) / 'manifest.json'
-
-
-def load_manifest(client_slug):
-    path = manifest_path(client_slug)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding='utf-8'))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_manifest(client_slug, context, library_id, documents):
-    directory = client_data_dir(client_slug)
-    directory.mkdir(parents=True, exist_ok=True)
-    payload = {
-        'context': compact_context(context),
-        'libraryId': library_id,
-        'documents': documents,
-        'updatedAt': datetime.now().isoformat(timespec='seconds'),
-    }
-    manifest_path(client_slug).write_text(json.dumps(payload, indent=2), encoding='utf-8')
-
-
-def existing_pdf_paths(client_slug):
-    docs_dir = client_data_dir(client_slug) / 'pdfs'
-    return {
-        filename: docs_dir / filename
-        for filename in PDF_FILES
-        if (docs_dir / filename).is_file() and (docs_dir / filename).stat().st_size > 0
-    }
+def ensure_mcp_template():
+    """Keep a generic MCP template separate from any real client folder."""
+    if MCP_TEMPLATE_DIR.exists():
+        return MCP_TEMPLATE_DIR
+    if not LEGACY_SOURCE_MCP_DIR.exists():
+        raise FileNotFoundError('MCP client template is missing.')
+    shutil.copytree(
+        LEGACY_SOURCE_MCP_DIR,
+        MCP_TEMPLATE_DIR,
+        ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.env', 'mistral_pdf_config.py'),
+    )
+    return MCP_TEMPLATE_DIR
 
 
 def load_mcp_document_config(client_slug):
@@ -138,6 +108,25 @@ def load_mcp_document_config(client_slug):
 
 
 def load_existing_mistral_assets(client_slug):
+    # The shared registry is the source of truth. This folder fallback supports
+    # migration from the former per-client MCP layout.
+    try:
+        from database import get_connection
+
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT mistral_library_id, mistral_pdf_documents
+                FROM mcp_client_registry
+                WHERE client_match = %s;
+                """,
+                (client_slug.replace('_', ' '),),
+            ).fetchone()
+            if row and row[0]:
+                return row[0], row[1] or []
+    except Exception:
+        pass
+
     values = dotenv_values(MCP_ROOT / f'{client_slug}_mcp' / '.env')
     library_id = values.get('MISTRAL_LIBRARY_ID') or None
     documents = load_mcp_document_config(client_slug)
@@ -154,14 +143,16 @@ def missing_document_names(documents):
 
 
 def existing_or_new_context(client_slug, client_name, industry, geography):
-    manifest_context = load_manifest(client_slug).get('context')
-    if isinstance(manifest_context, dict) and manifest_context:
-        return manifest_context
-
-    has_existing_output = (
-        client_data_dir(client_slug).exists()
-        or (MCP_ROOT / f'{client_slug}_mcp').exists()
-    )
+    has_existing_output = (MCP_ROOT / f'{client_slug}_mcp').exists()
+    if not has_existing_output:
+        try:
+            with psycopg.connect(**get_base_db_config('postgres')) as conn:
+                has_existing_output = conn.execute(
+                    'SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = %s);',
+                    (db_name_for_client(client_name),),
+                ).fetchone()[0]
+        except Exception:
+            pass
     return build_context(client_name, industry, geography) if has_existing_output else generate_context_with_agent(client_name, industry, geography)
 
 
@@ -276,7 +267,7 @@ def start_client_mcp(mcp_folder, port):
 
 
 def get_base_db_config(dbname='postgres'):
-    env = dotenv_values(SOURCE_MCP_DIR / '.env')
+    env = dotenv_values(ensure_mcp_template() / '.env')
     return {
         'host': env.get('POSTGRES_HOST') or os.getenv('POSTGRES_HOST', 'localhost'),
         'port': env.get('POSTGRES_PORT') or os.getenv('POSTGRES_PORT', '5432'),
@@ -318,7 +309,11 @@ def build_context(client_name, industry, geography):
 
 
 def get_mistral_api_key():
-    return os.getenv('MISTRAL_API_KEY') or dotenv_values(SOURCE_MCP_DIR / '.env').get('MISTRAL_API_KEY')
+    return (
+        os.getenv('MISTRAL_API_KEY')
+        or dotenv_values(ROOT_DIR / 'backend' / '.env').get('MISTRAL_API_KEY')
+        or dotenv_values(ensure_mcp_template() / '.env').get('MISTRAL_API_KEY')
+    )
 
 
 def extract_conversation_text(response):
@@ -504,20 +499,19 @@ def write_pdf(path, filename, context):
     remember_document(context, filename, document.get('document_summary', 'Generated PDF document.'))
 
 
-def create_pdfs(client_slug, context, filenames=None):
-    docs_dir = client_data_dir(client_slug) / 'pdfs'
+def create_pdfs(output_dir, context, filenames=None):
+    docs_dir = Path(output_dir)
     docs_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for filename in PDF_FILES if filenames is None else filenames:
         path = docs_dir / filename
-        if not path.exists() or path.stat().st_size == 0:
-            write_pdf(path, filename, context)
+        write_pdf(path, filename, context)
         paths.append(path)
     return paths
 
 
 def create_mistral_library_and_upload(context, pdf_paths, library_id=None, existing_documents=None):
-    api_key = os.getenv('MISTRAL_API_KEY') or dotenv_values(SOURCE_MCP_DIR / '.env').get('MISTRAL_API_KEY')
+    api_key = os.getenv('MISTRAL_API_KEY') or dotenv_values(ensure_mcp_template() / '.env').get('MISTRAL_API_KEY')
     if not api_key:
         return library_id, existing_documents or [], []
 
@@ -692,12 +686,12 @@ def copy_client_mcp_folder(client_slug, dbname, library_id, documents, port):
     if target.exists():
         shutil.rmtree(target)
     shutil.copytree(
-        SOURCE_MCP_DIR,
+        ensure_mcp_template(),
         target,
         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'),
     )
 
-    source_env = dotenv_values(SOURCE_MCP_DIR / '.env')
+    source_env = dotenv_values(ensure_mcp_template() / '.env')
     env_lines = []
     for key in ['POSTGRES_HOST', 'POSTGRES_PORT', 'POSTGRES_USER', 'POSTGRES_PASSWORD', 'MISTRAL_API_KEY']:
         value = source_env.get(key) or os.getenv(key)
@@ -720,26 +714,65 @@ def copy_client_mcp_folder(client_slug, dbname, library_id, documents, port):
     return target
 
 
-def register_backend_mcp(client_name, port):
+def register_backend_mcp(client_name, dbname, library_id, documents):
     from database import get_connection
 
+    shared_url = os.getenv('SHARED_MCP_URL', 'http://127.0.0.1:8010/mcp')
     with get_connection() as conn:
         conn.execute(
             """
-            INSERT INTO mcp_client_registry (client_match, mcp_url, enabled)
-            VALUES (%s, %s, TRUE)
+            INSERT INTO mcp_client_registry (
+                client_match, mcp_url, client_database, mistral_library_id, mistral_pdf_documents, enabled
+            )
+            VALUES (%s, %s, %s, %s, %s::jsonb, TRUE)
             ON CONFLICT (client_match) DO UPDATE SET
                 mcp_url = EXCLUDED.mcp_url,
+                client_database = EXCLUDED.client_database,
+                mistral_library_id = EXCLUDED.mistral_library_id,
+                mistral_pdf_documents = EXCLUDED.mistral_pdf_documents,
                 enabled = TRUE,
                 updated_at = NOW();
             """,
-            (slugify(client_name).replace('_', ' '), f'http://127.0.0.1:{port}/mcp'),
+            (
+                slugify(client_name).replace('_', ' '), shared_url, dbname, library_id,
+                json.dumps(documents),
+            ),
         )
         conn.commit()
 
 
+def start_shared_mcp():
+    return start_client_mcp(SHARED_MCP_DIR, int(os.getenv('SHARED_MCP_PORT', '8010')))
+
+
 def split_qualified_table_name(table_name):
     return table_name.split('.', 1)
+
+
+def create_financial_table(conn, table_name, columns):
+    schema_name, bare_table_name = split_qualified_table_name(table_name)
+    conn.execute(psycopg.sql.SQL('CREATE SCHEMA IF NOT EXISTS {};').format(psycopg.sql.Identifier(schema_name)))
+    column_definitions = [psycopg.sql.SQL('{} TEXT').format(psycopg.sql.Identifier(column)) for column in columns]
+    conn.execute(psycopg.sql.SQL('DROP TABLE IF EXISTS {};').format(psycopg.sql.Identifier(schema_name, bare_table_name)))
+    conn.execute(
+        psycopg.sql.SQL('CREATE TABLE {} ({})').format(
+            psycopg.sql.Identifier(schema_name, bare_table_name),
+            psycopg.sql.SQL(', ').join(column_definitions),
+        )
+    )
+
+
+def insert_financial_rows(conn, table_name, columns, rows):
+    if not rows:
+        return
+    schema_name, bare_table_name = split_qualified_table_name(table_name)
+    query = psycopg.sql.SQL('INSERT INTO {} ({}) VALUES ({})').format(
+        psycopg.sql.Identifier(schema_name, bare_table_name),
+        psycopg.sql.SQL(', ').join(psycopg.sql.Identifier(column) for column in columns),
+        psycopg.sql.SQL(', ').join(psycopg.sql.Placeholder() for _ in columns),
+    )
+    with conn.cursor() as cur:
+        cur.executemany(query, rows)
 
 
 def missing_client_tables(dbname):
@@ -778,11 +811,9 @@ def seed_tables(dbname, context, missing_tables):
 
     import sys
 
-    intel_path = str(SOURCE_MCP_DIR)
+    intel_path = str(ensure_mcp_template())
     shadowed_modules = [
         'database',
-        'table_config',
-        'load_excel_tables',
         'load_section2_tables',
         'load_section3_tables',
     ]
@@ -792,10 +823,8 @@ def seed_tables(dbname, context, missing_tables):
     sys.path.insert(0, intel_path)
     try:
         from database import get_connection
-        from load_excel_tables import create_table, insert_rows, read_excel
         from load_section2_tables import create_section2_tables, create_support_clients_table, seed_customer_information, seed_ownership_structure
         from load_section3_tables import create_section3_tables, seed_forecast, seed_historical_financials, seed_simple_section3_tables
-        from table_config import TABLE_FILES
 
         with get_connection(dbname) as conn:
             create_support_clients_table(conn)
@@ -807,13 +836,14 @@ def seed_tables(dbname, context, missing_tables):
                 """,
                 (context['client_name'],),
             )
-            for table_name, path in TABLE_FILES.items():
+            for table_name in FINANCIAL_TABLE_NAMES:
                 if table_name not in missing_tables:
                     continue
-                columns, rows = read_excel(path)
-                rows = generate_rows_for_table(table_name, columns, rows, context)
-                create_table(conn, table_name, columns)
-                insert_rows(conn, table_name, columns, rows)
+                schema = FINANCIAL_TABLES[table_name]
+                columns = schema['columns']
+                rows = generate_rows_for_table(table_name, columns, schema['fallbackRows'], context)
+                create_financial_table(conn, table_name, columns)
+                insert_financial_rows(conn, table_name, columns, rows)
             if missing_tables.intersection(SECTION2_TABLE_NAMES):
                 create_section2_tables(conn)
                 if 'credit_dossier.section2_customer_information' in missing_tables:
@@ -841,7 +871,12 @@ def seed_tables(dbname, context, missing_tables):
                 sys.modules[name] = module
 
 
-def manufacture_client_data(client_name, industry, geography):
+def manufacture_client_data(client_name, industry, geography, progress_callback=None):
+    def report(percent, stage):
+        if progress_callback:
+            progress_callback(percent, stage)
+
+    report(5, 'Preparing client manufacturing context')
     client_slug = slugify(client_name)
     dbname = db_name_for_client(client_name)
     context = existing_or_new_context(client_slug, client_name, industry, geography)
@@ -849,64 +884,50 @@ def manufacture_client_data(client_name, industry, geography):
     context.setdefault('industry', industry)
     context.setdefault('geography', geography)
 
-    existing_pdfs = existing_pdf_paths(client_slug)
-    missing_pdfs = [filename for filename in PDF_FILES if filename not in existing_pdfs]
-    generated_pdf_paths = create_pdfs(client_slug, context, missing_pdfs)
-    all_pdf_paths = [client_data_dir(client_slug) / 'pdfs' / filename for filename in PDF_FILES]
-
-    manifest = load_manifest(client_slug)
-    library_id = manifest.get('libraryId') or None
-    documents = manifest.get('documents') if isinstance(manifest.get('documents'), list) else []
     configured_library_id, configured_documents = load_existing_mistral_assets(client_slug)
-    if not library_id:
-        library_id = configured_library_id
-    if not documents:
-        documents = configured_documents
+    library_id = configured_library_id
+    documents = configured_documents
     missing_documents = missing_document_names(documents)
+    report(15, 'Creating or validating client database')
     ensure_database(dbname)
     upload_error = None
     uploaded_document_names = []
     if missing_documents:
+        report(30, 'Generating and uploading PDF source documents')
         try:
-            upload_paths = [client_data_dir(client_slug) / 'pdfs' / filename for filename in missing_documents]
-            library_id, documents, uploaded_document_names = create_mistral_library_and_upload(
-                context,
-                upload_paths,
-                library_id=library_id,
-                existing_documents=documents,
-            )
+            # PDFs only exist locally for the upload operation and are removed immediately.
+            with tempfile.TemporaryDirectory(prefix=f'{client_slug}_pdfs_') as temporary_directory:
+                upload_paths = create_pdfs(temporary_directory, context, missing_documents)
+                library_id, documents, uploaded_document_names = create_mistral_library_and_upload(
+                    context,
+                    upload_paths,
+                    library_id=library_id,
+                    existing_documents=documents,
+                )
         except Exception as exc:
             upload_error = str(exc)
+    report(65, 'Validating Mistral library sources')
 
+    report(75, 'Generating PostgreSQL source tables')
     missing_tables = missing_client_tables(dbname)
     seed_tables(dbname, context, missing_tables)
-    previous_port = existing_mcp_port(client_slug)
-    refresh_mcp = mcp_needs_refresh(client_slug, dbname, library_id, documents)
-    if refresh_mcp and previous_port:
-        stop_mcp_server(previous_port)
-    mcp_port = previous_port or choose_mcp_port()
-    mcp_folder = (
-        copy_client_mcp_folder(client_slug, dbname, library_id, documents, mcp_port)
-        if refresh_mcp
-        else MCP_ROOT / f'{client_slug}_mcp'
-    )
-    register_backend_mcp(client_name, mcp_port)
-    mcp_start = start_client_mcp(mcp_folder, mcp_port)
-    save_manifest(client_slug, context, library_id, documents)
+    report(92, 'Registering client with the shared MCP')
+    register_backend_mcp(client_name, dbname, library_id, documents)
+    mcp_start = start_shared_mcp()
+    report(100, 'Client data manufacturing completed')
 
     return {
         'clientName': client_name,
         'industry': industry,
         'geography': geography,
         'databaseName': dbname,
-        'mcpFolder': str(mcp_folder),
-        'mcpUrl': f'http://127.0.0.1:{mcp_port}/mcp',
+        'mcpFolder': str(SHARED_MCP_DIR),
+        'mcpUrl': os.getenv('SHARED_MCP_URL', 'http://127.0.0.1:8010/mcp'),
         'mcpStarted': mcp_start['started'],
         'mcpReady': mcp_start['ready'],
         'mcpStatus': mcp_start['message'],
-        'pdfFolder': str(client_data_dir(client_slug) / 'pdfs'),
-        'pdfCount': len(all_pdf_paths),
-        'generatedPdfCount': len(generated_pdf_paths),
+        'pdfCount': len(PDF_FILES),
+        'generatedPdfCount': len(uploaded_document_names),
         'tableCount': 16,
         'seededTableCount': len(missing_tables),
         'mistralLibraryId': library_id,
@@ -914,3 +935,55 @@ def manufacture_client_data(client_name, industry, geography):
         'availableMistralPdfCount': len(documents),
         'uploadError': upload_error,
     }
+
+
+def drop_client_database(dbname):
+    with psycopg.connect(**get_base_db_config('postgres'), autocommit=True) as conn:
+        conn.execute(
+            """
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = %s AND pid <> pg_backend_pid();
+            """,
+            (dbname,),
+        )
+        conn.execute(psycopg.sql.SQL('DROP DATABASE IF EXISTS {};').format(psycopg.sql.Identifier(dbname)))
+
+
+def delete_manufactured_client_data(client_name):
+    """Remove all manufactured assets for one client after its final deal is deleted."""
+    client_slug = slugify(client_name)
+    dbname = db_name_for_client(client_name)
+    # Preserve a generic template before a client folder such as intel_mcp is removed.
+    ensure_mcp_template()
+    library_id, _ = load_existing_mistral_assets(client_slug)
+    client_mcp_dir = MCP_ROOT / f'{client_slug}_mcp'
+
+    if library_id:
+        # Existing clients retain their own runtime configuration even when the
+        # reusable template intentionally excludes secrets.
+        client_env = dotenv_values(client_mcp_dir / '.env') if client_mcp_dir.exists() else {}
+        api_key = client_env.get('MISTRAL_API_KEY') or get_mistral_api_key()
+        if not api_key:
+            raise RuntimeError('MISTRAL_API_KEY is required to delete the client Mistral library.')
+        try:
+            Mistral(api_key=api_key).beta.libraries.delete(library_id=library_id)
+        except Exception as exc:
+            if '404' not in str(exc):
+                raise
+
+    drop_client_database(dbname)
+
+    from database import get_connection
+
+    with get_connection() as conn:
+        conn.execute(
+            'DELETE FROM mcp_client_registry WHERE client_match = %s;',
+            (client_slug.replace('_', ' '),),
+        )
+        conn.commit()
+
+    if client_mcp_dir.exists() and client_mcp_dir != MCP_TEMPLATE_DIR:
+        shutil.rmtree(client_mcp_dir)
+
+    return {'databaseName': dbname, 'mistralLibraryId': library_id}

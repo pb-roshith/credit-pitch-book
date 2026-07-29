@@ -1,0 +1,4 @@
+mcp
+mistralai
+psycopg[binary]
+python-dotenv

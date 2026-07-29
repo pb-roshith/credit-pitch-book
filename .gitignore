@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Generated frontend output
+frontend/dist/
+
+# Temporary and generated client data
+excels/
+generated_manufactured_data/
+*.pdf
+*.xlsx
+
+# Per-client MCP runtime configuration
+mcp/*_mcp/.env
+mcp/*_mcp/mistral_pdf_config.py

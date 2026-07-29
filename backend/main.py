@@ -8,16 +8,17 @@ import os
 import re
 import secrets
 import time
+from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from fastapi import FastAPI, HTTPException, Query, Response, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from mistralai.client import Mistral
 from pydantic import BaseModel, Field
 from psycopg.rows import dict_row
 
 from database import get_connection, init_db
-from manufacture_data import manufacture_client_data
+from manufacture_data import delete_manufactured_client_data, manufacture_client_data
 from mcp_client import call_mcp_tool, list_mcp_tools
 from narrative_generation_agent import generate_narrative as run_narrative_generation_agent
 from narrative_judge import judge_narrative as run_narrative_judge_agent
@@ -26,6 +27,7 @@ from telemetry import configure_telemetry, get_tracer, trace_id_from_span
 
 
 app = FastAPI(title='Credit Pitch Book API')
+manufacture_jobs = {}
 
 app.add_middleware(
     CORSMiddleware,
@@ -562,8 +564,8 @@ def resolve_mcp_registry_for_client(client_name):
                 """
                 SELECT *
                 FROM mcp_client_registry
-                WHERE enabled = TRUE AND POSITION(LOWER(client_match) IN LOWER(%s)) > 0
-                ORDER BY LENGTH(client_match) DESC, registry_id ASC
+                WHERE enabled = TRUE AND LOWER(client_match) = LOWER(TRIM(%s))
+                ORDER BY registry_id ASC
                 LIMIT 1;
                 """,
                 (client_name,),
@@ -727,7 +729,9 @@ async def discover_table_sources(registry, section, tools):
     if 'list_credit_tables' not in tool_names or 'fetch_credit_table_rows' not in tool_names:
         return []
 
-    table_result = await call_mcp_tool(registry['mcp_url'], 'list_credit_tables', {})
+    table_result = await call_mcp_tool(
+        registry['mcp_url'], 'list_credit_tables', {'client_name': registry['client_match']}
+    )
     table_names = extract_tool_payload(table_result)
     if not isinstance(table_names, list):
         return []
@@ -755,7 +759,7 @@ async def discover_table_sources(registry, section, tools):
             result = await call_mcp_tool(
                 registry['mcp_url'],
                 'fetch_credit_table_rows',
-                {'table_name': table_name, 'limit': 50},
+                {'client_name': registry['client_match'], 'table_name': table_name, 'limit': 50},
             )
         except Exception:
             continue
@@ -939,7 +943,9 @@ async def discover_sources(registry, section):
         if tool['name'] in existing_source_keys:
             continue
         try:
-            result = await call_mcp_tool(registry['mcp_url'], tool['name'], {})
+            result = await call_mcp_tool(
+                registry['mcp_url'], tool['name'], {'client_name': registry['client_match']}
+            )
         except Exception:
             continue
         text = extract_tool_text(result)
@@ -1307,16 +1313,44 @@ def list_narrative_sections():
             return [row_to_narrative_section(row) for row in cur.fetchall()]
 
 
-@app.post('/api/manufacture-data')
-def manufacture_data(payload: ManufactureDataRequest):
+def run_manufacture_job(job_id, payload):
+    job = manufacture_jobs[job_id]
+
+    def update_progress(percent, stage):
+        job.update({'status': 'running', 'progress': percent, 'stage': stage})
+
     try:
-        return manufacture_client_data(
+        job['result'] = manufacture_client_data(
             client_name=payload.clientName.strip(),
             industry=payload.industry.strip(),
             geography=payload.geography.strip(),
+            progress_callback=update_progress,
         )
+        job.update({'status': 'completed', 'progress': 100, 'stage': 'Client data manufacturing completed'})
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        job.update({'status': 'failed', 'error': str(exc), 'stage': 'Manufacturing failed'})
+
+
+@app.post('/api/manufacture-data')
+def manufacture_data(payload: ManufactureDataRequest, background_tasks: BackgroundTasks):
+    job_id = str(uuid4())
+    manufacture_jobs[job_id] = {
+        'status': 'queued',
+        'progress': 0,
+        'stage': 'Queued for manufacturing',
+        'result': None,
+        'error': None,
+    }
+    background_tasks.add_task(run_manufacture_job, job_id, payload)
+    return {'jobId': job_id}
+
+
+@app.get('/api/manufacture-data/{job_id}')
+def get_manufacture_data_progress(job_id: str):
+    job = manufacture_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail='Manufacturing job was not found.')
+    return job
 
 
 @app.get('/api/observability')
@@ -2046,7 +2080,10 @@ async def get_deal_mcp_tools(deal_id: int):
 @app.post('/api/deals/{deal_id}/mcp/tools/{tool_name}')
 async def run_deal_mcp_tool(deal_id: int, tool_name: str, payload: McpToolCall):
     row, registry = get_deal_mcp_context_or_403(deal_id)
-    result = await call_mcp_tool(registry['mcp_url'], tool_name, payload.arguments)
+    # The deal's registry match is authoritative; callers cannot switch the
+    # shared MCP request to another client's data.
+    tool_arguments = {**payload.arguments, 'client_name': registry['client_match']}
+    result = await call_mcp_tool(registry['mcp_url'], tool_name, tool_arguments)
     return {
         'dealId': deal_id,
         'customer': row['legal_name'],
@@ -2310,12 +2347,14 @@ async def run_narrative_judge(deal_id: int, section_number: int, payload: Narrat
                 result = await call_mcp_tool(
                     registry['mcp_url'],
                     'fetch_credit_table_rows',
-                    {'table_name': table_name, 'limit': 50},
+                    {'client_name': registry['client_match'], 'table_name': table_name, 'limit': 50},
                 )
                 payload = extract_tool_payload(result)
                 text = json.dumps(payload, indent=2, default=str) if payload else ''
             else:
-                result = await call_mcp_tool(registry['mcp_url'], tool_name, {})
+                result = await call_mcp_tool(
+                    registry['mcp_url'], tool_name, {'client_name': registry['client_match']}
+                )
                 text = extract_tool_text(result)
         except Exception:
             text = ''
@@ -2642,6 +2681,27 @@ def save_narrative_edit(deal_id: int, section_number: int, payload: NarrativeEdi
 
 @app.delete('/api/deals/{deal_id}', status_code=status.HTTP_204_NO_CONTENT)
 def delete_deal(deal_id: int):
+    with get_connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute('SELECT legal_name FROM deals WHERE id = %s;', (deal_id,))
+            deal = cur.fetchone()
+            if not deal:
+                raise HTTPException(status_code=404, detail='Deal not found')
+            cur.execute(
+                'SELECT COUNT(*) AS count FROM deals WHERE legal_name = %s AND id <> %s;',
+                (deal['legal_name'], deal_id),
+            )
+            has_other_client_deals = cur.fetchone()['count'] > 0
+
+    if not has_other_client_deals:
+        try:
+            delete_manufactured_client_data(deal['legal_name'])
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f'Client assets could not be deleted, so the deal was kept: {exc}',
+            ) from exc
+
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute('DELETE FROM deals WHERE id = %s;', (deal_id,))

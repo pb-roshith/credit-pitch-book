@@ -1,6 +1,6 @@
 import { Factory, Loader2, WandSparkles } from 'lucide-react';
 import { useState } from 'react';
-import { manufactureData } from '../services/api.js';
+import { fetchManufactureDataProgress, manufactureData } from '../services/api.js';
 
 export default function ManufactureData() {
   const [form, setForm] = useState({
@@ -11,6 +11,7 @@ export default function ManufactureData() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
+  const [progress, setProgress] = useState({ percent: 0, stage: '' });
 
   const updateField = (field, value) => {
     setForm((current) => ({ ...current, [field]: value }));
@@ -21,10 +22,21 @@ export default function ManufactureData() {
     setLoading(true);
     setError('');
     setResult(null);
+    setProgress({ percent: 0, stage: 'Queued for manufacturing' });
 
     try {
-      const response = await manufactureData(form);
-      setResult(response);
+      const { jobId } = await manufactureData(form);
+      let currentJob;
+      do {
+        await new Promise((resolve) => window.setTimeout(resolve, 700));
+        currentJob = await fetchManufactureDataProgress(jobId);
+        setProgress({ percent: currentJob.progress || 0, stage: currentJob.stage || '' });
+      } while (currentJob.status === 'queued' || currentJob.status === 'running');
+
+      if (currentJob.status === 'failed') {
+        throw new Error(currentJob.error || 'Data manufacturing failed.');
+      }
+      setResult(currentJob.result);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -90,6 +102,28 @@ export default function ManufactureData() {
           {loading ? 'Manufacturing data...' : 'Manufacture Data'}
         </button>
       </form>
+
+      {loading && (
+        <div className="rounded-lg border border-blue-100 bg-white p-5 shadow-enterprise">
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm font-bold text-slate-800">{progress.stage || 'Manufacturing data'}</p>
+            <p className="shrink-0 text-sm font-bold text-[#003A8C]">{progress.percent}%</p>
+          </div>
+          <div
+            className="mt-3 h-2 overflow-hidden rounded-full bg-slate-200"
+            role="progressbar"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow={progress.percent}
+            aria-label="Manufacturing data progress"
+          >
+            <div
+              className="h-full rounded-full bg-[#003A8C] transition-all duration-500"
+              style={{ width: `${progress.percent}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       {error && <div className="rounded-lg bg-red-50 px-4 py-3 text-sm font-semibold text-red-700">{error}</div>}
 

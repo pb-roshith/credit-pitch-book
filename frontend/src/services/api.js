@@ -135,6 +135,10 @@ export function manufactureData(payload) {
   });
 }
 
+export function fetchManufactureDataProgress(jobId) {
+  return request(`/manufacture-data/${jobId}`);
+}
+
 export function fetchObservability(clientName = '') {
   const query = clientName ? `?clientName=${encodeURIComponent(clientName)}` : '';
   return request(`/observability${query}`);

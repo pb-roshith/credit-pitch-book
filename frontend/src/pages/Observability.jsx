@@ -345,22 +345,17 @@ export default function Observability() {
           workflow={summary.sourceDiscovery}
           detail={summary.sourceDiscovery?.estimatedTokenUsage ? 'Token usage is estimated from the beta agent prompt and response.' : 'No source-discovery agent token estimate is available yet.'}
           extraStats={[
-            { label: 'Agent Runs', value: summary.sourceDiscovery?.agentRuns || 0 },
             { label: 'Retrieved Sources', value: summary.sourceDiscovery?.retrievedSources || 0 },
           ]}
         />
         <WorkflowSummary
           title="Narrative Generation"
           workflow={summary.narrativeGeneration}
-          extraStats={[
-            { label: 'Generated Drafts', value: summary.generatedDrafts || 0 },
-          ]}
         />
         <WorkflowSummary
           title="Judge"
           workflow={summary.judge}
           extraStats={[
-            { label: 'Judged Drafts', value: summary.judgedDrafts || 0 },
             { label: 'Average Judge Score', value: formatValue(summary.averageJudgePercent, '%') },
           ]}
         />

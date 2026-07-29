@@ -70,6 +70,9 @@ def init_db():
         registry_id BIGSERIAL PRIMARY KEY,
         client_match TEXT NOT NULL UNIQUE,
         mcp_url TEXT NOT NULL,
+        client_database TEXT,
+        mistral_library_id TEXT,
+        mistral_pdf_documents JSONB NOT NULL DEFAULT '[]'::jsonb,
         enabled BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -176,24 +179,13 @@ def init_db():
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS judge_confidence_score NUMERIC(5, 2);")
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS judge_explanation TEXT;")
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS judge_metadata JSONB NOT NULL DEFAULT '{}'::jsonb;")
+        conn.execute("ALTER TABLE mcp_client_registry ADD COLUMN IF NOT EXISTS client_database TEXT;")
+        conn.execute("ALTER TABLE mcp_client_registry ADD COLUMN IF NOT EXISTS mistral_library_id TEXT;")
+        conn.execute("ALTER TABLE mcp_client_registry ADD COLUMN IF NOT EXISTS mistral_pdf_documents JSONB NOT NULL DEFAULT '[]'::jsonb;")
         conn.execute(
             """
             ALTER TABLE mcp_client_registry
             DROP COLUMN IF EXISTS client_key;
             """
-        )
-        conn.execute(
-            """
-            INSERT INTO mcp_client_registry (client_match, mcp_url)
-            VALUES (%s, %s)
-            ON CONFLICT (client_match) DO UPDATE SET
-                mcp_url = EXCLUDED.mcp_url,
-                enabled = TRUE,
-                updated_at = NOW();
-            """,
-            (
-                os.getenv('DEFAULT_MCP_CLIENT_MATCH', 'intel'),
-                os.getenv('DEFAULT_MCP_URL', 'http://127.0.0.1:8010/mcp'),
-            ),
         )
         conn.commit()
