@@ -4,6 +4,8 @@ from contextlib import contextmanager
 import psycopg
 from dotenv import load_dotenv
 
+from narrative_section_seed import seed_narrative_sections
+
 load_dotenv()
 
 
@@ -169,6 +171,7 @@ def init_db():
         conn.execute(create_narrative_export_versions_table_sql)
         conn.execute(create_ai_observability_events_table_sql)
         conn.execute(create_otel_spans_table_sql)
+        seed_narrative_sections(conn)
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS version_type TEXT NOT NULL DEFAULT 'generated';")
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS edited_from_draft_id BIGINT REFERENCES narrative_drafts(draft_id) ON DELETE SET NULL;")
         conn.execute("ALTER TABLE narrative_drafts ADD COLUMN IF NOT EXISTS edited_by TEXT;")
